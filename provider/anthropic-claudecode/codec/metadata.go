@@ -7,7 +7,7 @@ import (
 )
 
 // ProviderName is the identifier for this provider in metadata.
-const ProviderName = "claudecode"
+const ProviderName = "anthropic-claudecode"
 
 // Metadata contains Claude Code CLI-specific metadata.
 type Metadata struct {

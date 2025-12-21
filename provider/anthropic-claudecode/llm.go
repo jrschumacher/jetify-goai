@@ -7,8 +7,8 @@ import (
 	"iter"
 
 	"go.jetify.com/ai/api"
-	"go.jetify.com/ai/provider/claudecode/codec"
-	"go.jetify.com/ai/provider/claudecode/process"
+	"go.jetify.com/ai/provider/anthropic-claudecode/codec"
+	"go.jetify.com/ai/provider/anthropic-claudecode/process"
 )
 
 // ModelOption is a function type that modifies a LanguageModel.

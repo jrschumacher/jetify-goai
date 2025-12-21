@@ -159,7 +159,7 @@ claude -p --resume "abc-123" "Tool result for get_weather: 72°F, sunny"
 ### Package Structure
 
 ```
-provider/claudecode/
+provider/anthropic-claudecode/
 ├── README.md           # This file
 ├── constants.go        # Provider name, model constants
 ├── llm.go              # LanguageModel implementation
@@ -211,7 +211,7 @@ type CLIEvent struct {
 ### LanguageModel Interface
 
 ```go
-func (m *LanguageModel) ProviderName() string { return "claudecode" }
+func (m *LanguageModel) ProviderName() string { return "anthropic-claudecode" }
 func (m *LanguageModel) ModelID() string { return m.modelID }
 func (m *LanguageModel) SupportedUrls() []api.SupportedURL { ... }
 func (m *LanguageModel) Generate(ctx context.Context, prompt []api.Message, opts api.CallOptions) (*api.Response, error)
@@ -365,7 +365,7 @@ Response includes:
 | `usage.input_tokens` | `Usage.InputTokens` |
 | `usage.output_tokens` | `Usage.OutputTokens` |
 | `usage.cache_read_input_tokens` | `Usage.CachedInputTokens` |
-| `total_cost_usd` | `ProviderMetadata.claudecode.cost_usd` |
+| `total_cost_usd` | `ProviderMetadata["anthropic-claudecode"].cost_usd` |
 
 ### Finish Reason Mapping
 
@@ -587,7 +587,7 @@ func TestIntegration_RealCLI_MultiTurn(t *testing.T)
 ### File Structure After Implementation
 
 ```
-provider/claudecode/
+provider/anthropic-claudecode/
 ├── README.md
 ├── constants.go            # ProviderName, model constants
 ├── llm.go                  # LanguageModel implementation
@@ -640,16 +640,16 @@ provider/claudecode/
 
 ```bash
 # Run codec tests only (fast, no I/O)
-go test ./provider/claudecode/codec/...
+go test ./provider/anthropic-claudecode/codec/...
 
 # Run all unit tests (with mock process)
-go test ./provider/claudecode/...
+go test ./provider/anthropic-claudecode/...
 
 # Run integration tests (requires CLI)
-CLAUDECODE_INTEGRATION_TESTS=1 go test ./provider/claudecode/... -v
+CLAUDECODE_INTEGRATION_TESTS=1 go test ./provider/anthropic-claudecode/... -v
 
 # Run with race detector
-go test -race ./provider/claudecode/...
+go test -race ./provider/anthropic-claudecode/...
 ```
 
 ## Future Considerations

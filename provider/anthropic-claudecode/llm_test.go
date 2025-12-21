@@ -7,7 +7,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.jetify.com/ai/api"
-	"go.jetify.com/ai/provider/claudecode/process"
+	"go.jetify.com/ai/provider/anthropic-claudecode/process"
 )
 
 func TestLanguageModel_ProviderName(t *testing.T) {

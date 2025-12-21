@@ -10,10 +10,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.jetify.com/ai/api"
-	"go.jetify.com/ai/provider/claudecode/codec"
+	"go.jetify.com/ai/provider/anthropic-claudecode/codec"
 )
 
-// Run with: go test ./provider/claudecode -tags=integration -v -run TestIntegration
+// Run with: go test ./provider/anthropic-claudecode -tags=integration -v -run TestIntegration
 
 func TestIntegration_Generate(t *testing.T) {
 	model := NewLanguageModel("sonnet")
