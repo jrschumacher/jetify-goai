@@ -67,6 +67,7 @@ func (m *LanguageModel) Generate(
 
 	// Get or create process
 	proc := m.proc
+	ownsProc := false
 	if proc == nil {
 		procOpts := []process.Option{
 			process.WithModel(m.modelID),
@@ -78,6 +79,12 @@ func (m *LanguageModel) Generate(
 			procOpts = append(procOpts, process.WithTemperature(*opts.Temperature))
 		}
 		proc = process.NewCLIProcess(procOpts...)
+		ownsProc = true
+	}
+
+	// Ensure cleanup of locally-created process
+	if ownsProc {
+		defer proc.Stop()
 	}
 
 	// Start the process if not running
@@ -88,18 +95,26 @@ func (m *LanguageModel) Generate(
 	}
 
 	// Send messages to the CLI
+	stdin := proc.Stdin()
+	if stdin == nil {
+		return nil, fmt.Errorf("process stdin not available")
+	}
 	for _, msg := range messages {
 		encoded, err := codec.EncodeMessage(msg)
 		if err != nil {
 			return nil, fmt.Errorf("failed to encode message: %w", err)
 		}
-		if _, err := proc.Stdin().Write(append(encoded, '\n')); err != nil {
+		if _, err := stdin.Write(append(encoded, '\n')); err != nil {
 			return nil, fmt.Errorf("failed to write to CLI: %w", err)
 		}
 	}
 
 	// Read events from stdout until we get a result
-	scanner := bufio.NewScanner(proc.Stdout())
+	stdout := proc.Stdout()
+	if stdout == nil {
+		return nil, fmt.Errorf("process stdout not available")
+	}
+	scanner := bufio.NewScanner(stdout)
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {
@@ -141,6 +156,7 @@ func (m *LanguageModel) Stream(
 
 	// Get or create process
 	proc := m.proc
+	ownsProc := false
 	if proc == nil {
 		procOpts := []process.Option{
 			process.WithModel(m.modelID),
@@ -152,29 +168,48 @@ func (m *LanguageModel) Stream(
 			procOpts = append(procOpts, process.WithTemperature(*opts.Temperature))
 		}
 		proc = process.NewCLIProcess(procOpts...)
+		ownsProc = true
 	}
 
 	// Start the process if not running
 	if !proc.IsRunning() {
 		if err := proc.Start(ctx); err != nil {
+			if ownsProc {
+				proc.Stop()
+			}
 			return nil, fmt.Errorf("failed to start CLI process: %w", err)
 		}
 	}
 
 	// Send messages to the CLI
+	stdin := proc.Stdin()
+	if stdin == nil {
+		if ownsProc {
+			proc.Stop()
+		}
+		return nil, fmt.Errorf("process stdin not available")
+	}
 	for _, msg := range messages {
 		encoded, err := codec.EncodeMessage(msg)
 		if err != nil {
+			if ownsProc {
+				proc.Stop()
+			}
 			return nil, fmt.Errorf("failed to encode message: %w", err)
 		}
-		if _, err := proc.Stdin().Write(append(encoded, '\n')); err != nil {
+		if _, err := stdin.Write(append(encoded, '\n')); err != nil {
+			if ownsProc {
+				proc.Stop()
+			}
 			return nil, fmt.Errorf("failed to write to CLI: %w", err)
 		}
 	}
 
 	// Create the stream decoder
 	decoder := &streamDecoder{
-		proc: proc,
+		ctx:      ctx,
+		proc:     proc,
+		ownsProc: ownsProc,
 	}
 
 	return &api.StreamResponse{
@@ -184,7 +219,9 @@ func (m *LanguageModel) Stream(
 
 // streamDecoder maintains state while decoding a stream of Claude Code CLI events.
 type streamDecoder struct {
+	ctx        context.Context
 	proc       process.Process
+	ownsProc   bool // true if we should stop the process when done
 	sessionID  string
 	responseID string
 	modelID    string
@@ -194,9 +231,30 @@ type streamDecoder struct {
 // decodeEvents returns an iterator that yields events from the CLI stream.
 func (d *streamDecoder) decodeEvents() iter.Seq[api.StreamEvent] {
 	return func(yield func(api.StreamEvent) bool) {
-		scanner := bufio.NewScanner(d.proc.Stdout())
+		// Ensure cleanup when iterator finishes (either normally or early exit)
+		if d.ownsProc {
+			defer d.proc.Stop()
+		}
+
+		// Check for context cancellation before starting
+		if err := d.ctx.Err(); err != nil {
+			yield(&api.ErrorEvent{Err: fmt.Errorf("context cancelled: %w", err)})
+			return
+		}
+
+		stdout := d.proc.Stdout()
+		if stdout == nil {
+			yield(&api.ErrorEvent{Err: fmt.Errorf("process stdout not available")})
+			return
+		}
+		scanner := bufio.NewScanner(stdout)
 
 		for scanner.Scan() {
+			// Check for context cancellation on each iteration
+			if err := d.ctx.Err(); err != nil {
+				yield(&api.ErrorEvent{Err: fmt.Errorf("context cancelled: %w", err)})
+				return
+			}
 			line := scanner.Bytes()
 			if len(line) == 0 {
 				continue
@@ -309,7 +367,12 @@ func (d *streamDecoder) decodeEvents() iter.Seq[api.StreamEvent] {
 		}
 
 		if err := scanner.Err(); err != nil {
-			yield(&api.ErrorEvent{Err: fmt.Errorf("error reading CLI output: %w", err)})
+			// Check if this was due to context cancellation
+			if ctxErr := d.ctx.Err(); ctxErr != nil {
+				yield(&api.ErrorEvent{Err: fmt.Errorf("context cancelled: %w", ctxErr)})
+			} else {
+				yield(&api.ErrorEvent{Err: fmt.Errorf("error reading CLI output: %w", err)})
+			}
 		}
 	}
 }
