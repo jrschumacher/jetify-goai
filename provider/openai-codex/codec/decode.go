@@ -97,7 +97,7 @@ func (c *EventCollector) ProcessEvent(event *Event) (bool, error) {
 // Build creates an api.Response from the collected events.
 func (c *EventCollector) Build() (*api.Response, error) {
 	if c.hasError {
-		return nil, fmt.Errorf("codex error: %s", c.errorMsg)
+		return nil, fmt.Errorf("Codex error: %s", c.errorMsg)
 	}
 
 	metadata := &Metadata{
