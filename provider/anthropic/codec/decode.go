@@ -77,25 +77,20 @@ func decodeContent(blocks []anthropic.BetaContentBlockUnion) []api.ContentBlock 
 	return content
 }
 
-// decodeToolUse converts an Anthropic tool use block to an AI SDK ToolCallBlock
+// decodeToolUse converts an Anthropic tool use block to an AI SDK ToolCallBlock.
+// It safely handles nil or invalid input by returning an empty JSON object as args.
 func decodeToolUse(block anthropic.BetaContentBlockUnion) *api.ToolCallBlock {
-	var args string
-	if block.Input != nil {
-		rawArgs, err := json.Marshal(block.Input)
-		if err == nil {
-			args = string(rawArgs)
-		} else {
-			// If marshaling fails, use empty JSON object
-			args = "{}"
-		}
-	} else {
-		args = "{}"
+	args := json.RawMessage("{}")
+
+	// block.Input is json.RawMessage - validate it before using
+	if len(block.Input) > 0 && json.Valid(block.Input) {
+		args = block.Input
 	}
 
 	return &api.ToolCallBlock{
 		ToolCallID: block.ID,
 		ToolName:   block.Name,
-		Args:       json.RawMessage(args),
+		Args:       args,
 	}
 }
 

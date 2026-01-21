@@ -2,6 +2,7 @@ package anthropic
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"go.jetify.com/ai/api"
@@ -69,17 +70,17 @@ func (m *LanguageModel) Generate(
 ) (*api.Response, error) {
 	params, warnings, err := codec.EncodeParams(m.modelID, prompt, opts)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("anthropic: encoding request params: %w", err)
 	}
 
 	message, err := m.client.Beta.Messages.New(ctx, params)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("anthropic: API request failed: %w", err)
 	}
 
 	response, err := codec.DecodeResponse(message)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("anthropic: decoding response: %w", err)
 	}
 
 	response.Warnings = append(response.Warnings, warnings...)
@@ -89,5 +90,17 @@ func (m *LanguageModel) Generate(
 func (m *LanguageModel) Stream(
 	ctx context.Context, prompt []api.Message, opts api.CallOptions,
 ) (*api.StreamResponse, error) {
-	return nil, api.NewUnsupportedFunctionalityError("streaming generation", "")
+	// TODO: add warnings to the stream response by adding an initial StreamStart event
+	params, _, err := codec.EncodeParams(m.modelID, prompt, opts)
+	if err != nil {
+		return nil, fmt.Errorf("anthropic: encoding request params: %w", err)
+	}
+
+	stream := m.client.Beta.Messages.NewStreaming(ctx, params)
+	response, err := codec.DecodeStream(stream)
+	if err != nil {
+		return nil, fmt.Errorf("anthropic: decoding stream: %w", err)
+	}
+
+	return response, nil
 }

@@ -31,7 +31,9 @@ type anthropicMessage struct {
 	betas       []anthropic.AnthropicBeta
 }
 
-// EncodePrompt converts an AI SDK prompt into Anthropic's message format
+// EncodePrompt converts an AI SDK prompt into Anthropic's message format.
+// It returns an error if the prompt contains invalid message types or unsupported
+// message sequences (e.g., system messages interleaved with user/assistant messages).
 func EncodePrompt(prompt []api.Message) (*AnthropicPrompt, error) {
 	// Pre-process the prompt to merge messages of the same type together.
 	// TODO: maybe this should move out of the provider, and be done by the framework
@@ -43,10 +45,10 @@ func EncodePrompt(prompt []api.Message) (*AnthropicPrompt, error) {
 	hasSeenNonSystem := false
 	var betas []anthropic.AnthropicBeta
 
-	for _, msg := range prompt {
+	for i, msg := range prompt {
 		result, err := processMessage(msg)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("encoding message at index %d: %w", i, err)
 		}
 
 		if result.message != nil {
@@ -55,7 +57,7 @@ func EncodePrompt(prompt []api.Message) (*AnthropicPrompt, error) {
 		}
 		if result.systemBlock != nil {
 			if hasSeenNonSystem && len(systemBlocks) > 0 {
-				return nil, fmt.Errorf("multiple system messages separated by user/assistant messages are not supported")
+				return nil, fmt.Errorf("encoding message at index %d: multiple system messages separated by user/assistant messages are not supported", i)
 			}
 			systemBlocks = append(systemBlocks, *result.systemBlock)
 		}
