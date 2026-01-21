@@ -42,11 +42,15 @@ With ChatGPT authentication, only certain models are available:
 
 | Model | ChatGPT Auth | API Key |
 |-------|--------------|---------|
+| `gpt-5.2-codex-max` | ✅ | ✅ |
+| `gpt-5.2-codex` | ✅ | ✅ |
 | `gpt-5.1-codex-max` | ✅ | ✅ |
 | `o3` | ❌ | ✅ |
 | `o4-mini` | ❌ | ✅ |
 | `gpt-4o` | ❌ | ✅ |
 | `gpt-4.1` | ❌ | ✅ |
+
+*Last updated: January 2026. Model availability changes frequently. The Codex CLI does not provide a command to list supported models, so this table may be outdated.*
 
 When using an unsupported model with ChatGPT auth, you'll receive:
 ```
@@ -193,7 +197,7 @@ The app-server emits incremental delta events:
 <<< {"id":0,"result":{"userAgent":"codex_cli_rs/0.63.0..."}}
 
 >>> thread/start
-<<< {"id":1,"result":{"thread":{"id":"019b..."},"model":"gpt-5.1-codex-max"}}
+<<< {"id":1,"result":{"thread":{"id":"019b..."},"model":"gpt-5.2-codex-max"}}
 <<< {"method":"thread/started","params":{...}}
 
 >>> turn/start
@@ -251,7 +255,7 @@ ls schemas/v2/  # AgentMessageDeltaNotification.json, etc.
 Config file: `~/.codex/config.toml`
 
 ```toml
-model = "gpt-5.1-codex-max"
+model = "gpt-5.2-codex-max"
 
 [mcp_servers.playwright]
 command = "npx"
@@ -262,12 +266,12 @@ args = ["@playwright/mcp@latest"]
 
 ### Provider Design
 
-This provider follows the same pattern as `claudecode`:
+This provider uses the persistent `codex app-server` mode for true streaming:
 
-1. **Process Management**: Spawn `codex exec` as subprocess
-2. **Message Encoding**: Convert API messages to prompt strings
-3. **Event Parsing**: Parse JSONL events from stdout
-4. **Response Decoding**: Convert events to `api.Response`
+1. **Process Management**: Spawn persistent `codex app-server` subprocess
+2. **JSON-RPC Communication**: Send requests, receive notification streams
+3. **Config-Based Restart**: Automatically restart process when config changes
+4. **Response Decoding**: Convert JSON-RPC notifications to `api.StreamEvent`
 
 ### Key Differences from claudecode
 
@@ -310,90 +314,95 @@ These patterns were established in the `anthropic-claudecode` provider and apply
 
 ```
 provider/openai-codex/
-├── constants.go        # ProviderName, model constants
-├── llm.go              # LanguageModel implementation
+├── llm.go              # LanguageModel implementation (app-server mode)
 ├── llm_test.go         # Unit tests with mock process
 ├── integration_test.go # Integration tests (build tag)
 ├── codec/
 │   ├── events.go       # JSONL event type definitions
 │   ├── encode.go       # api.Message → CLI input format
 │   ├── decode.go       # CLI output → api.Response
-│   ├── decode_stream.go # Stream event decoding
-│   └── metadata.go     # Provider-specific metadata
+│   ├── decode_stream.go # Stream event decoding (exec mode)
+│   ├── decode_appserver.go # App-server notification decoding
+│   ├── metadata.go     # Provider-specific metadata
+│   └── jsonrpc/
+│       ├── types.go    # JSON-RPC 2.0 message types
+│       └── client.go   # JSON-RPC client with async message pump
 └── process/
-    ├── interface.go    # Process interface for testability
-    ├── process.go      # Real CLI process implementation
-    └── mock.go         # Mock process for unit tests
+    ├── interface.go    # Process and AppServer interfaces
+    ├── appserver.go    # App-server process implementation
+    └── mock.go         # MockAppServer for unit tests
 ```
 
-### Process Interface Pattern
+### AppServer Interface Pattern
 
 ```go
-type Process interface {
-    Start(ctx context.Context) error
-    Stop() error
-    Stdin() io.Writer   // For streaming input (if needed)
-    Stdout() io.Reader  // JSONL event stream
-    Stderr() io.Reader
-    Wait() error
-    IsRunning() bool
-    SessionID() string
-    SetSessionID(id string)
+type AppServer interface {
+    Process  // Start, Stop, IsRunning, etc.
+    Initialize(ctx context.Context) error
+    StartThread(ctx context.Context) (string, error)
+    StartTurn(ctx context.Context, threadID string, input []Input, policy ApprovalPolicy) error
+    Notifications() <-chan *Notification  // Streaming notifications
+    Client() *jsonrpc.Client
 }
 ```
 
 ### Streaming Implementation
 
-Return `iter.Seq[api.StreamEvent]` that reads from stdout:
+Return `iter.Seq[api.StreamEvent]` that reads from notification channel:
 
 ```go
 func (d *streamDecoder) decodeEvents() iter.Seq[api.StreamEvent] {
     return func(yield func(api.StreamEvent) bool) {
-        scanner := bufio.NewScanner(d.proc.Stdout())
+        notifications := d.proc.Notifications()
 
-        for scanner.Scan() {
-            event, err := codec.ParseEvent(scanner.Bytes())
+        for notif := range notifications {
+            event, err := codec.DecodeNotification(notif)
             if err != nil {
                 yield(&api.ErrorEvent{Err: err})
                 continue
             }
 
-            streamEvent := decodeStreamEvent(event)
-            if streamEvent != nil {
-                if !yield(streamEvent) {
+            if event != nil {
+                if !yield(event) {
+                    return
+                }
+                // turn/completed signals end of stream
+                if _, ok := event.(*api.FinishEvent); ok {
                     return
                 }
             }
         }
-
-        // End with FinishEvent containing usage stats
-        yield(&api.FinishEvent{
-            FinishReason: finishReason,
-            Usage:        usage,
-        })
     }
 }
 ```
 
-### Mock Process for Testing
+### Mock AppServer for Testing
 
 ```go
-type MockProcess struct {
-    stdout *bytes.Buffer
-    stdin  *bytes.Buffer
+type MockAppServer struct {
+    notifications chan *jsonrpc.Notification
     // ...
 }
 
-func (m *MockProcess) WriteStdout(data []byte) {
-    m.stdout.Write(data)
+func (m *MockAppServer) SendNotification(method string, params any) {
+    m.notifications <- &jsonrpc.Notification{Method: method, Params: params}
 }
 
 // In tests:
-mockProc := process.NewMockProcess()
-mockProc.WriteStdout([]byte(`{"type":"thread.started","thread_id":"abc"}` + "\n"))
-mockProc.WriteStdout([]byte(`{"type":"turn.completed","usage":{...}}` + "\n"))
+mockProc := process.NewMockAppServer()
+mockProc.OnStartThread = func(ctx context.Context) (string, error) {
+    go func() {
+        mockProc.SendNotification("item/agentMessage/delta", codec.TextDeltaParams{
+            ItemID: "item_1", Delta: "Hello world",
+        })
+        mockProc.SendNotification("turn/completed", codec.TurnCompletedParams{
+            Usage: &codec.AppServerUsage{InputTokens: 100, OutputTokens: 10},
+        })
+    }()
+    return "thread-123", nil
+}
 
-model := NewLanguageModel("gpt-5.1-codex-max", WithProcess(mockProc))
+model := NewLanguageModel("gpt-5.2-codex-max", WithAppServer(mockProc))
 ```
 
 ### Integration Tests

@@ -14,9 +14,12 @@ import (
 )
 
 // Run with: go test ./provider/openai-codex -tags=integration -v -run TestIntegration
+//
+// These tests use an empty model ID to let codex use its configured default model.
+// This avoids flakiness when model availability changes.
 
 func TestIntegration_Generate(t *testing.T) {
-	model := NewLanguageModel("o3")
+	model := NewLanguageModel("")
 
 	prompt := []api.Message{
 		&api.UserMessage{
@@ -41,7 +44,7 @@ func TestIntegration_Generate(t *testing.T) {
 }
 
 func TestIntegration_WithSystemPrompt(t *testing.T) {
-	model := NewLanguageModel("o3")
+	model := NewLanguageModel("")
 
 	prompt := []api.Message{
 		&api.SystemMessage{Content: "You are a pirate. Respond in pirate speak. Keep responses under 20 words."},
@@ -68,7 +71,7 @@ func TestIntegration_WithSystemPrompt(t *testing.T) {
 }
 
 func TestIntegration_UsageMetadata(t *testing.T) {
-	model := NewLanguageModel("o3")
+	model := NewLanguageModel("")
 
 	prompt := []api.Message{
 		&api.UserMessage{
@@ -100,7 +103,7 @@ func TestIntegration_MultiTurn(t *testing.T) {
 	// Note: Codex uses one-shot execution, so multi-turn is simulated
 	// by including the full conversation context in the prompt.
 
-	model := NewLanguageModel("o3")
+	model := NewLanguageModel("")
 
 	// Send full conversation context in a single request
 	prompt := []api.Message{
@@ -127,7 +130,7 @@ func TestIntegration_MultiTurn(t *testing.T) {
 }
 
 func TestIntegration_LongResponse(t *testing.T) {
-	model := NewLanguageModel("o3")
+	model := NewLanguageModel("")
 
 	prompt := []api.Message{
 		&api.UserMessage{
@@ -151,7 +154,7 @@ func TestIntegration_LongResponse(t *testing.T) {
 }
 
 func TestIntegration_FinishReason(t *testing.T) {
-	model := NewLanguageModel("o3")
+	model := NewLanguageModel("")
 
 	prompt := []api.Message{
 		&api.UserMessage{
@@ -168,7 +171,7 @@ func TestIntegration_FinishReason(t *testing.T) {
 }
 
 func TestIntegration_EmptyPromptHandling(t *testing.T) {
-	model := NewLanguageModel("o3")
+	model := NewLanguageModel("")
 
 	// Minimal input
 	prompt := []api.Message{
@@ -186,7 +189,7 @@ func TestIntegration_EmptyPromptHandling(t *testing.T) {
 }
 
 func TestIntegration_SpecialCharacters(t *testing.T) {
-	model := NewLanguageModel("o3")
+	model := NewLanguageModel("")
 
 	prompt := []api.Message{
 		&api.UserMessage{
@@ -210,7 +213,7 @@ func TestIntegration_SpecialCharacters(t *testing.T) {
 }
 
 func TestIntegration_JSONOutput(t *testing.T) {
-	model := NewLanguageModel("o3")
+	model := NewLanguageModel("")
 
 	prompt := []api.Message{
 		&api.SystemMessage{Content: "Always respond with valid JSON only. No markdown, no explanation."},
@@ -238,7 +241,7 @@ func TestIntegration_JSONOutput(t *testing.T) {
 }
 
 func TestIntegration_CodeGeneration(t *testing.T) {
-	model := NewLanguageModel("o3")
+	model := NewLanguageModel("")
 
 	prompt := []api.Message{
 		&api.UserMessage{
@@ -260,7 +263,7 @@ func TestIntegration_CodeGeneration(t *testing.T) {
 }
 
 func TestIntegration_Stream(t *testing.T) {
-	model := NewLanguageModel("o3")
+	model := NewLanguageModel("")
 
 	prompt := []api.Message{
 		&api.UserMessage{
@@ -325,7 +328,7 @@ func TestIntegration_Stream(t *testing.T) {
 }
 
 func TestIntegration_StreamWithSystemPrompt(t *testing.T) {
-	model := NewLanguageModel("o3")
+	model := NewLanguageModel("")
 
 	prompt := []api.Message{
 		&api.SystemMessage{Content: "You are a helpful assistant. Keep responses very brief."},
@@ -367,7 +370,7 @@ func TestIntegration_StreamWithSystemPrompt(t *testing.T) {
 
 func TestIntegration_StreamWithReasoning(t *testing.T) {
 	// Test that reasoning events are captured during streaming
-	model := NewLanguageModel("o3")
+	model := NewLanguageModel("")
 
 	prompt := []api.Message{
 		&api.UserMessage{
