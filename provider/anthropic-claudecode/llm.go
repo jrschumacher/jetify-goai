@@ -231,14 +231,22 @@ type streamDecoder struct {
 // decodeEvents returns an iterator that yields events from the CLI stream.
 func (d *streamDecoder) decodeEvents() iter.Seq[api.StreamEvent] {
 	return func(yield func(api.StreamEvent) bool) {
+		stopProc := func() {
+			_ = d.proc.Stop()
+		}
+
 		// Ensure cleanup when iterator finishes (either normally or early exit)
 		if d.ownsProc {
-			defer func() { _ = d.proc.Stop() }()
+			defer stopProc()
 		}
 
 		// Check for context cancellation before starting
 		if err := d.ctx.Err(); err != nil {
-			yield(&api.ErrorEvent{Err: fmt.Errorf("context cancelled: %w", err)})
+			if !yield(&api.ErrorEvent{Err: fmt.Errorf("context cancelled: %w", err)}) {
+				stopProc()
+				return
+			}
+			stopProc()
 			return
 		}
 
@@ -252,7 +260,11 @@ func (d *streamDecoder) decodeEvents() iter.Seq[api.StreamEvent] {
 		for scanner.Scan() {
 			// Check for context cancellation on each iteration
 			if err := d.ctx.Err(); err != nil {
-				yield(&api.ErrorEvent{Err: fmt.Errorf("context cancelled: %w", err)})
+				if !yield(&api.ErrorEvent{Err: fmt.Errorf("context cancelled: %w", err)}) {
+					stopProc()
+					return
+				}
+				stopProc()
 				return
 			}
 			line := scanner.Bytes()
@@ -263,6 +275,7 @@ func (d *streamDecoder) decodeEvents() iter.Seq[api.StreamEvent] {
 			event, err := codec.ParseEvent(line)
 			if err != nil {
 				if !yield(&api.ErrorEvent{Err: fmt.Errorf("failed to parse event: %w", err)}) {
+					stopProc()
 					return
 				}
 				continue
@@ -342,6 +355,7 @@ func (d *streamDecoder) decodeEvents() iter.Seq[api.StreamEvent] {
 				streamEvent, err := codec.DecodeStreamEvent(event)
 				if err != nil {
 					if !yield(&api.ErrorEvent{Err: err}) {
+						stopProc()
 						return
 					}
 					continue
@@ -359,6 +373,7 @@ func (d *streamDecoder) decodeEvents() iter.Seq[api.StreamEvent] {
 				}
 
 				if !yield(streamEvent) {
+					stopProc()
 					return
 				}
 			}
@@ -369,9 +384,16 @@ func (d *streamDecoder) decodeEvents() iter.Seq[api.StreamEvent] {
 		if err := scanner.Err(); err != nil {
 			// Check if this was due to context cancellation
 			if ctxErr := d.ctx.Err(); ctxErr != nil {
-				yield(&api.ErrorEvent{Err: fmt.Errorf("context cancelled: %w", ctxErr)})
+				if !yield(&api.ErrorEvent{Err: fmt.Errorf("context cancelled: %w", ctxErr)}) {
+					stopProc()
+					return
+				}
+				stopProc()
 			} else {
-				yield(&api.ErrorEvent{Err: fmt.Errorf("error reading CLI output: %w", err)})
+				if !yield(&api.ErrorEvent{Err: fmt.Errorf("error reading CLI output: %w", err)}) {
+					stopProc()
+					return
+				}
 			}
 		}
 	}

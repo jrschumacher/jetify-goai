@@ -3,6 +3,7 @@ package process
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -28,6 +29,7 @@ type CLIProcess struct {
 	// Sandbox and lifecycle management
 	tempDir  string        // Path to auto-created temp directory (empty if not created)
 	waitDone chan struct{} // Closed when cmd.Wait() completes (for detecting unexpected exit)
+	waitErr  error         // Captured error from cmd.Wait()
 }
 
 var _ Process = &CLIProcess{}
@@ -50,6 +52,7 @@ func (p *CLIProcess) Start(ctx context.Context) error {
 
 	// Clean up any previous state (allows restart after unexpected exit)
 	p.cleanupStateLocked()
+	p.waitErr = nil
 
 	// Auto-create sandbox directory if WorkDir not specified
 	workDir := p.config.WorkDir
@@ -95,8 +98,9 @@ func (p *CLIProcess) Start(ctx context.Context) error {
 	// Start monitoring goroutine to detect unexpected exit
 	p.waitDone = make(chan struct{})
 	go func() {
-		_ = p.cmd.Wait() // Ignore error, handled via state
+		err := p.cmd.Wait()
 		p.mu.Lock()
+		p.waitErr = err
 		// Only update state if Stop() hasn't already done so
 		if p.running && p.waitDone != nil {
 			p.running = false
@@ -127,6 +131,7 @@ func (p *CLIProcess) cleanupStateLocked() {
 	}
 	p.cmd = nil
 	p.waitDone = nil
+	p.waitErr = nil
 }
 
 // cleanupOnStartError cleans up resources after a Start() error.
@@ -151,6 +156,7 @@ func (p *CLIProcess) cleanupOnStartError() {
 		p.tempDir = ""
 	}
 	p.cmd = nil
+	p.waitErr = nil
 }
 
 // buildArgs constructs the CLI arguments from config.
@@ -219,7 +225,8 @@ func (p *CLIProcess) Stop() error {
 
 	// Close stdin to signal EOF to the process
 	if p.stdin != nil {
-		if err := p.stdin.Close(); err != nil && firstErr == nil {
+		if err := p.stdin.Close(); err != nil && firstErr == nil &&
+			!errors.Is(err, os.ErrClosed) && !errors.Is(err, io.ErrClosedPipe) {
 			firstErr = fmt.Errorf("failed to close stdin: %w", err)
 		}
 		p.stdin = nil
@@ -257,14 +264,16 @@ func (p *CLIProcess) Stop() error {
 
 	// Close remaining pipes
 	if p.stdout != nil {
-		if err := p.stdout.Close(); err != nil && firstErr == nil {
+		if err := p.stdout.Close(); err != nil && firstErr == nil &&
+			!errors.Is(err, os.ErrClosed) && !errors.Is(err, io.ErrClosedPipe) {
 			firstErr = fmt.Errorf("failed to close stdout: %w", err)
 		}
 		p.stdout = nil
 	}
 
 	if p.stderr != nil {
-		if err := p.stderr.Close(); err != nil && firstErr == nil {
+		if err := p.stderr.Close(); err != nil && firstErr == nil &&
+			!errors.Is(err, os.ErrClosed) && !errors.Is(err, io.ErrClosedPipe) {
 			firstErr = fmt.Errorf("failed to close stderr: %w", err)
 		}
 		p.stderr = nil
@@ -280,6 +289,7 @@ func (p *CLIProcess) Stop() error {
 
 	p.cmd = nil
 	p.waitDone = nil
+	p.waitErr = nil
 	return firstErr
 }
 
@@ -321,13 +331,18 @@ func (p *CLIProcess) Stderr() io.Reader {
 // or has already been stopped.
 func (p *CLIProcess) Wait() error {
 	p.mu.Lock()
-	cmd := p.cmd
+	waitDone := p.waitDone
 	p.mu.Unlock()
 
-	if cmd == nil {
+	if waitDone == nil {
 		return nil
 	}
-	return cmd.Wait()
+	<-waitDone
+
+	p.mu.Lock()
+	err := p.waitErr
+	p.mu.Unlock()
+	return err
 }
 
 // IsRunning implements Process.IsRunning.

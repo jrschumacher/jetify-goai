@@ -5,6 +5,7 @@ package claudecode
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -267,13 +268,15 @@ func TestIntegration_JSONOutput(t *testing.T) {
 	textBlock := resp.Content[0].(*api.TextBlock)
 	t.Logf("JSON Response: %s", textBlock.Text)
 
-	// Try to parse as JSON
+	// Try to parse as JSON, with a fallback to extract a JSON object.
 	var result map[string]any
-	err = json.Unmarshal([]byte(textBlock.Text), &result)
-	if err != nil {
-		// Sometimes the model wraps in markdown, try to extract
-		t.Logf("Note: Response may contain markdown wrapper")
+	payload := strings.TrimSpace(textBlock.Text)
+	if !json.Valid([]byte(payload)) {
+		payload = extractJSONObject(payload)
 	}
+	require.True(t, json.Valid([]byte(payload)), "expected valid JSON, got: %s", textBlock.Text)
+	err = json.Unmarshal([]byte(payload), &result)
+	require.NoError(t, err)
 }
 
 func TestIntegration_CodeGeneration(t *testing.T) {
@@ -427,6 +430,15 @@ func toLower(s string) string {
 
 func containsStr(s, substr string) bool {
 	return len(substr) <= len(s) && (s == substr || len(substr) == 0 || findSubstr(s, substr) >= 0)
+}
+
+func extractJSONObject(input string) string {
+	start := strings.Index(input, "{")
+	end := strings.LastIndex(input, "}")
+	if start == -1 || end == -1 || end <= start {
+		return input
+	}
+	return input[start : end+1]
 }
 
 func findSubstr(s, substr string) int {
