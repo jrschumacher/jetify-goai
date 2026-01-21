@@ -4,12 +4,15 @@ package process
 import (
 	"context"
 	"io"
+
+	"go.jetify.com/ai/provider/openai-codex/codec/jsonrpc"
 )
 
 // Process represents a Codex CLI process.
-// Unlike Claude Code, Codex uses one-shot execution with the prompt as a CLI argument.
+// The primary implementation is AppServerProcess which uses the persistent
+// codex app-server mode for streaming and multi-turn conversations.
 type Process interface {
-	// Start launches the CLI process with the configured prompt.
+	// Start launches the CLI process.
 	// Returns an error if the process fails to start.
 	Start(ctx context.Context) error
 
@@ -18,10 +21,9 @@ type Process interface {
 	Stop() error
 
 	// Stdin returns a writer for sending input to the CLI.
-	// Note: For Codex, stdin is typically not used as the prompt is passed via CLI args.
 	Stdin() io.Writer
 
-	// Stdout returns a reader for receiving JSONL events from the CLI.
+	// Stdout returns a reader for receiving output from the CLI.
 	Stdout() io.Reader
 
 	// Stderr returns a reader for error output from the CLI.
@@ -42,13 +44,29 @@ type Process interface {
 	SetThreadID(id string)
 }
 
+// AppServer extends Process with app-server specific methods.
+type AppServer interface {
+	Process
+
+	// Initialize sends the initialize RPC to the server.
+	Initialize(ctx context.Context) error
+
+	// StartThread creates a new conversation thread.
+	StartThread(ctx context.Context) (string, error)
+
+	// StartTurn begins a new turn in the conversation.
+	StartTurn(ctx context.Context, threadID string, input []jsonrpc.Input, policy jsonrpc.ApprovalPolicy) error
+
+	// Notifications returns the channel for receiving streaming notifications.
+	Notifications() <-chan *jsonrpc.Notification
+
+	// Client returns the JSON-RPC client for direct access if needed.
+	Client() *jsonrpc.Client
+}
+
 // Config contains configuration for the CLI process.
 type Config struct {
-	// Prompt is the prompt to send to the CLI.
-	// For multi-turn conversations, this should be the concatenated prompt.
-	Prompt string
-
-	// Model is the model ID to use (e.g., "o3", "o4-mini").
+	// Model is the model ID to use (e.g., "o3", "o4-mini", "gpt-5.1-codex-max").
 	Model string
 
 	// SystemPrompt is the system prompt to use.
@@ -57,29 +75,12 @@ type Config struct {
 	// WorkDir is the working directory for the CLI process.
 	WorkDir string
 
-	// JSONOutput enables JSON output mode.
-	// This is required for parsing the event stream.
-	JSONOutput bool
-
-	// SkipGitRepoCheck skips the git repository check.
-	SkipGitRepoCheck bool
-
-	// FullAutoMode enables full autonomy mode.
-	FullAutoMode bool
-
-	// Verbose enables verbose output from the CLI.
-	Verbose bool
+	// Temperature controls randomness in the model's output.
+	Temperature *float64
 }
 
 // Option is a function that modifies Config.
 type Option func(*Config)
-
-// WithPrompt sets the prompt.
-func WithPrompt(prompt string) Option {
-	return func(c *Config) {
-		c.Prompt = prompt
-	}
-}
 
 // WithModel sets the model ID.
 func WithModel(model string) Option {
@@ -102,42 +103,41 @@ func WithWorkDir(dir string) Option {
 	}
 }
 
-// WithJSONOutput enables JSON output mode.
-func WithJSONOutput(enabled bool) Option {
+// WithTemperature sets the temperature for the model.
+func WithTemperature(temp float64) Option {
 	return func(c *Config) {
-		c.JSONOutput = enabled
-	}
-}
-
-// WithSkipGitRepoCheck skips the git repository check.
-func WithSkipGitRepoCheck(skip bool) Option {
-	return func(c *Config) {
-		c.SkipGitRepoCheck = skip
-	}
-}
-
-// WithFullAutoMode enables full autonomy mode.
-func WithFullAutoMode(enabled bool) Option {
-	return func(c *Config) {
-		c.FullAutoMode = enabled
-	}
-}
-
-// WithVerbose enables verbose output.
-func WithVerbose(verbose bool) Option {
-	return func(c *Config) {
-		c.Verbose = verbose
+		c.Temperature = &temp
 	}
 }
 
 // NewConfig creates a new Config with the given options.
 func NewConfig(opts ...Option) *Config {
-	cfg := &Config{
-		JSONOutput:       true, // Default to JSON for parsing
-		SkipGitRepoCheck: true, // Default to skip for SDK usage
-	}
+	cfg := &Config{}
 	for _, opt := range opts {
 		opt(cfg)
 	}
 	return cfg
+}
+
+// ConfigKey returns a comparable key for the config.
+// Used to detect when config changes require process restart.
+func (c *Config) ConfigKey() ConfigKey {
+	var temp float64
+	if c.Temperature != nil {
+		temp = *c.Temperature
+	}
+	return ConfigKey{
+		Model:        c.Model,
+		SystemPrompt: c.SystemPrompt,
+		Temperature:  temp,
+		HasTemp:      c.Temperature != nil,
+	}
+}
+
+// ConfigKey is a comparable struct for detecting config changes.
+type ConfigKey struct {
+	Model        string
+	SystemPrompt string
+	Temperature  float64
+	HasTemp      bool
 }
