@@ -70,7 +70,7 @@ func (p *CLIProcess) Start(ctx context.Context) error {
 
 	// Start the process
 	if err := p.cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start codex CLI: %w", err)
+		return fmt.Errorf("failed to start Codex CLI: %w", err)
 	}
 
 	p.running = true
