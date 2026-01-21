@@ -25,6 +25,20 @@ func WithAppServer(proc process.AppServer) ModelOption {
 	}
 }
 
+// WithCostMonitor sets a cost monitor for tracking and limiting token usage.
+func WithCostMonitor(monitor *CostMonitor) ModelOption {
+	return func(m *LanguageModel) {
+		m.costMonitor = monitor
+	}
+}
+
+// WithRetryPolicy sets a custom retry policy for handling transient failures.
+func WithRetryPolicy(policy *RetryPolicy) ModelOption {
+	return func(m *LanguageModel) {
+		m.retryPolicy = policy
+	}
+}
+
 // LanguageModel represents a Codex CLI language model using app-server mode.
 // It maintains a persistent process for efficient streaming and multi-turn conversations.
 type LanguageModel struct {
@@ -36,6 +50,12 @@ type LanguageModel struct {
 	// cachedKey tracks the config used to start the current process.
 	// If options change, the process is restarted.
 	cachedKey process.ConfigKey
+
+	// costMonitor tracks token usage and enforces budget limits.
+	costMonitor *CostMonitor
+
+	// retryPolicy defines how operations should be retried on failure.
+	retryPolicy *RetryPolicy
 }
 
 var _ api.LanguageModel = &LanguageModel{}
@@ -113,16 +133,32 @@ func (m *LanguageModel) ensureProcess(ctx context.Context, cfg *process.Config) 
 		m.proc = process.NewAppServerProcess(procOpts...)
 	}
 
-	// Start the process if not running
+	// Start the process if not running, with retry logic if configured
 	if !m.proc.IsRunning() {
-		if err := m.proc.Start(ctx); err != nil {
-			return fmt.Errorf("failed to start app-server: %w", err)
+		startFn := func() error {
+			if err := m.proc.Start(ctx); err != nil {
+				return WrapError(fmt.Errorf("failed to start app-server: %w", err))
+			}
+
+			// Initialize the connection
+			if err := m.proc.Initialize(ctx); err != nil {
+				m.proc.Stop()
+				return WrapError(fmt.Errorf("failed to initialize app-server: %w", err))
+			}
+
+			return nil
 		}
 
-		// Initialize the connection
-		if err := m.proc.Initialize(ctx); err != nil {
-			m.proc.Stop()
-			return fmt.Errorf("failed to initialize app-server: %w", err)
+		// Use retry policy if configured, otherwise execute once
+		var err error
+		if m.retryPolicy != nil {
+			err = m.retryPolicy.Execute(ctx, startFn)
+		} else {
+			err = startFn()
+		}
+
+		if err != nil {
+			return err
 		}
 	}
 
@@ -150,7 +186,7 @@ func (m *LanguageModel) Generate(
 	// Start a new thread for this request
 	threadID, err := proc.StartThread(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to start thread: %w", err)
+		return nil, WrapError(fmt.Errorf("failed to start thread: %w", err))
 	}
 
 	// Build input for the turn
@@ -160,7 +196,7 @@ func (m *LanguageModel) Generate(
 
 	// Start the turn
 	if err := proc.StartTurn(ctx, threadID, input, jsonrpc.ApprovalNever); err != nil {
-		return nil, fmt.Errorf("failed to start turn: %w", err)
+		return nil, WrapError(fmt.Errorf("failed to start turn: %w", err))
 	}
 
 	// Collect response from notifications
@@ -206,10 +242,19 @@ func (m *LanguageModel) Generate(
 
 			case *api.FinishEvent:
 				usage = e.Usage
+
+				// Track usage if cost monitor is configured
+				if m.costMonitor != nil {
+					if err := m.costMonitor.TrackUsage(usage); err != nil {
+						return nil, err
+					}
+				}
+
 				// Build and return the response
 				resp := &api.Response{
-					Content: content,
-					Usage:   usage,
+					Content:      content,
+					FinishReason: e.FinishReason,
+					Usage:        usage,
 					ResponseInfo: &api.ResponseInfo{
 						ID: threadID,
 					},
@@ -230,9 +275,9 @@ func (m *LanguageModel) Generate(
 
 			case *api.ErrorEvent:
 				if err, ok := e.Err.(error); ok {
-					return nil, err
+					return nil, WrapError(err)
 				}
-				return nil, fmt.Errorf("%v", e.Err)
+				return nil, WrapError(fmt.Errorf("%v", e.Err))
 			}
 		}
 	}
@@ -258,7 +303,7 @@ func (m *LanguageModel) Stream(
 	// Start a new thread for this request
 	threadID, err := proc.StartThread(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to start thread: %w", err)
+		return nil, WrapError(fmt.Errorf("failed to start thread: %w", err))
 	}
 
 	// Build input for the turn
@@ -268,14 +313,15 @@ func (m *LanguageModel) Stream(
 
 	// Start the turn
 	if err := proc.StartTurn(ctx, threadID, input, jsonrpc.ApprovalNever); err != nil {
-		return nil, fmt.Errorf("failed to start turn: %w", err)
+		return nil, WrapError(fmt.Errorf("failed to start turn: %w", err))
 	}
 
 	// Create the stream decoder
 	decoder := &streamDecoder{
-		ctx:      ctx,
-		proc:     proc,
-		threadID: threadID,
+		ctx:         ctx,
+		proc:        proc,
+		threadID:    threadID,
+		costMonitor: m.costMonitor,
 	}
 
 	return &api.StreamResponse{
@@ -285,10 +331,11 @@ func (m *LanguageModel) Stream(
 
 // streamDecoder maintains state while decoding a stream of app-server notifications.
 type streamDecoder struct {
-	ctx       context.Context
-	proc      process.AppServer
-	threadID  string
-	reasoning string
+	ctx          context.Context
+	proc         process.AppServer
+	threadID     string
+	reasoning    string
+	costMonitor  *CostMonitor
 }
 
 // decodeEvents returns an iterator that yields events from the notification stream.
@@ -334,6 +381,14 @@ func (d *streamDecoder) decodeEvents() iter.Seq[api.StreamEvent] {
 
 				// Enhance finish event with provider metadata
 				if finish, ok := event.(*api.FinishEvent); ok {
+					// Track usage if cost monitor is configured
+					if d.costMonitor != nil {
+						if err := d.costMonitor.TrackUsage(finish.Usage); err != nil {
+							yield(&api.ErrorEvent{Err: err})
+							return
+						}
+					}
+
 					metadata := &codec.Metadata{
 						ThreadID:  d.threadID,
 						Reasoning: d.reasoning,
@@ -343,6 +398,13 @@ func (d *streamDecoder) decodeEvents() iter.Seq[api.StreamEvent] {
 					})
 					yield(finish)
 					return
+				}
+
+				// Wrap error events with classification
+				if errEvent, ok := event.(*api.ErrorEvent); ok {
+					if err, ok := errEvent.Err.(error); ok {
+						errEvent.Err = WrapError(err)
+					}
 				}
 
 				if !yield(event) {

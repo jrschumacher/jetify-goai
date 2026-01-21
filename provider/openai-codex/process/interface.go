@@ -77,6 +77,29 @@ type Config struct {
 
 	// Temperature controls randomness in the model's output.
 	Temperature *float64
+
+	// SandboxMode controls the execution sandbox mode.
+	// Valid values: "workspace-write", "read-only", "no-access"
+	SandboxMode string
+
+	// SkipGitRepoCheck allows working in non-git directories.
+	SkipGitRepoCheck bool
+
+	// NetworkAccess controls whether the model can access the network.
+	NetworkAccess bool
+
+	// WebSearch enables/disables web search capability.
+	WebSearch bool
+
+	// MCPServers defines MCP server configurations.
+	MCPServers map[string]MCPServerConfig
+}
+
+// MCPServerConfig defines configuration for an MCP server.
+type MCPServerConfig struct {
+	Command string
+	Args    []string
+	Env     map[string]string
 }
 
 // Option is a function that modifies Config.
@@ -110,6 +133,62 @@ func WithTemperature(temp float64) Option {
 	}
 }
 
+// WithSandboxMode sets the execution sandbox mode.
+// Valid values: "workspace-write", "read-only", "no-access"
+func WithSandboxMode(mode string) Option {
+	return func(c *Config) {
+		c.SandboxMode = mode
+	}
+}
+
+// WithSkipGitRepoCheck allows working in non-git directories.
+func WithSkipGitRepoCheck(skip bool) Option {
+	return func(c *Config) {
+		c.SkipGitRepoCheck = skip
+	}
+}
+
+// WithNetworkAccess controls network connectivity.
+func WithNetworkAccess(allow bool) Option {
+	return func(c *Config) {
+		c.NetworkAccess = allow
+	}
+}
+
+// WithWebSearch enables/disables web search capability.
+func WithWebSearch(enable bool) Option {
+	return func(c *Config) {
+		c.WebSearch = enable
+	}
+}
+
+// WithMCPServer adds an MCP server configuration.
+func WithMCPServer(name, command string, args ...string) Option {
+	return func(c *Config) {
+		if c.MCPServers == nil {
+			c.MCPServers = make(map[string]MCPServerConfig)
+		}
+		c.MCPServers[name] = MCPServerConfig{
+			Command: command,
+			Args:    args,
+		}
+	}
+}
+
+// WithMCPServerEnv adds an MCP server configuration with environment variables.
+func WithMCPServerEnv(name, command string, env map[string]string, args ...string) Option {
+	return func(c *Config) {
+		if c.MCPServers == nil {
+			c.MCPServers = make(map[string]MCPServerConfig)
+		}
+		c.MCPServers[name] = MCPServerConfig{
+			Command: command,
+			Args:    args,
+			Env:     env,
+		}
+	}
+}
+
 // NewConfig creates a new Config with the given options.
 func NewConfig(opts ...Option) *Config {
 	cfg := &Config{}
@@ -126,18 +205,39 @@ func (c *Config) ConfigKey() ConfigKey {
 	if c.Temperature != nil {
 		temp = *c.Temperature
 	}
+
+	// Serialize MCP servers for comparison
+	mcpKey := ""
+	if len(c.MCPServers) > 0 {
+		// Simple serialization - just concatenate names
+		// In practice, full comparison would serialize the entire config
+		for name := range c.MCPServers {
+			mcpKey += name + ","
+		}
+	}
+
 	return ConfigKey{
-		Model:        c.Model,
-		SystemPrompt: c.SystemPrompt,
-		Temperature:  temp,
-		HasTemp:      c.Temperature != nil,
+		Model:            c.Model,
+		SystemPrompt:     c.SystemPrompt,
+		Temperature:      temp,
+		HasTemp:          c.Temperature != nil,
+		SandboxMode:      c.SandboxMode,
+		SkipGitRepoCheck: c.SkipGitRepoCheck,
+		NetworkAccess:    c.NetworkAccess,
+		WebSearch:        c.WebSearch,
+		MCPServersKey:    mcpKey,
 	}
 }
 
 // ConfigKey is a comparable struct for detecting config changes.
 type ConfigKey struct {
-	Model        string
-	SystemPrompt string
-	Temperature  float64
-	HasTemp      bool
+	Model            string
+	SystemPrompt     string
+	Temperature      float64
+	HasTemp          bool
+	SandboxMode      string
+	SkipGitRepoCheck bool
+	NetworkAccess    bool
+	WebSearch        bool
+	MCPServersKey    string
 }

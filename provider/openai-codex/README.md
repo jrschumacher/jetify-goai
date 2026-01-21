@@ -1,35 +1,50 @@
 # OpenAI Codex Provider
 
-This provider enables using OpenAI models through the `codex` CLI without requiring a direct OpenAI API key. Similar to the `claudecode` provider, it leverages CLI authentication (ChatGPT OAuth) to access OpenAI's models.
+This provider enables using OpenAI models through the `codex` CLI without requiring a direct OpenAI API key. It leverages CLI authentication (ChatGPT OAuth) to access OpenAI's models with true token-by-token streaming support.
 
 ## Overview
 
-The [Codex CLI](https://developers.openai.com/codex/cli/) is OpenAI's official command-line tool for interacting with their models. It supports OAuth-based authentication through ChatGPT accounts, eliminating the need for API keys.
+The [Codex CLI](https://developers.openai.com/codex/cli/) is OpenAI's official command-line tool for interacting with their models. Key features:
+
+- **No API key required** - Uses ChatGPT OAuth authentication
+- **True streaming** - Token-by-token streaming via app-server mode
+- **Persistent sessions** - Multi-turn conversations with automatic context management
+- **Model access** - ChatGPT subscription provides access to codex-optimized models
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                   openaicodex.LanguageModel                      │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  Codex CLI App-Server (persistent process)                │   │
+│  │                                                            │   │
+│  │  codex app-server                                         │   │
+│  │  (JSON-RPC 2.0 over stdio)                                │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│       ▲                                    │                     │
+│       │ JSON-RPC requests                  │ Streaming deltas    │
+│       │                                    ▼                     │
+│  ┌────────────────┐                 ┌────────────────┐          │
+│  │ Encoder        │                 │ Decoder        │          │
+│  │ api.Message →  │                 │ JSON-RPC →     │          │
+│  │ turn/start     │                 │ api.Response   │          │
+│  └────────────────┘                 └────────────────┘          │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 ## Authentication
 
 ### ChatGPT OAuth (No API Key Required)
 
-The codex CLI uses device authentication flow tied to ChatGPT accounts:
-
 ```bash
 codex login
 ```
 
-This stores OAuth tokens in `~/.codex/auth.json`:
-
-```json
-{
-  "OPENAI_API_KEY": null,
-  "tokens": {
-    "id_token": "...",
-    "access_token": "...",
-    "refresh_token": "..."
-  }
-}
-```
-
-### Login Status
+This stores OAuth tokens in `~/.codex/auth.json`. Verify login status:
 
 ```bash
 codex login status
@@ -38,7 +53,7 @@ codex login status
 
 ## Available Models
 
-With ChatGPT authentication, only certain models are available:
+With ChatGPT authentication, codex-optimized models are available:
 
 | Model | ChatGPT Auth | API Key |
 |-------|--------------|---------|
@@ -50,207 +65,302 @@ With ChatGPT authentication, only certain models are available:
 | `gpt-4o` | ❌ | ✅ |
 | `gpt-4.1` | ❌ | ✅ |
 
-*Last updated: January 2026. Model availability changes frequently. The Codex CLI does not provide a command to list supported models, so this table may be outdated.*
+*Last updated: January 2026. Model availability changes frequently.*
 
-When using an unsupported model with ChatGPT auth, you'll receive:
-```
-The '<model>' model is not supported when using Codex with a ChatGPT account.
-```
+## Quick Start
 
-## Programmatic Usage
+### Basic Usage
 
-### Non-Interactive Execution
+```go
+import (
+    "context"
+    "github.com/jetify-com/goai/api"
+    codex "github.com/jetify-com/goai/provider/openai-codex"
+)
 
-```bash
-codex exec --json --skip-git-repo-check "Your prompt here"
-```
+// Create model (uses ChatGPT OAuth from ~/.codex/auth.json)
+model := codex.NewLanguageModel("gpt-5.2-codex-max")
 
-Key flags:
-- `--json`: Output events as JSONL to stdout
-- `--skip-git-repo-check`: Allow running outside git repositories
-- `--model <MODEL>`: Specify model (default from config)
-- `-o, --output-last-message <FILE>`: Write final response to file
-- `--output-schema <FILE>`: Enforce JSON schema on output
+// Generate response
+resp, err := model.Generate(ctx, []api.Message{
+    {Role: api.RoleUser, Content: "What is 2 + 2?"},
+}, api.CallOptions{})
 
-### Example
+// Stream response (true token-by-token streaming)
+streamResp, err := model.Stream(ctx, []api.Message{
+    {Role: api.RoleUser, Content: "Explain recursion"},
+}, api.CallOptions{})
 
-```bash
-codex exec --json --skip-git-repo-check "What is 2 + 2?"
-```
-
-Output:
-```jsonl
-{"type":"thread.started","thread_id":"019b3cf8-21e8-7430-9ca3-4d38435173e4"}
-{"type":"turn.started"}
-{"type":"item.completed","item":{"id":"item_0","type":"reasoning","text":"..."}}
-{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"4"}}
-{"type":"turn.completed","usage":{"input_tokens":4972,"cached_input_tokens":0,"output_tokens":9}}
-```
-
-## JSONL Event Format
-
-### Event Types
-
-| Event Type | Description |
-|------------|-------------|
-| `thread.started` | Session initialization, contains `thread_id` |
-| `turn.started` | Beginning of a request/response turn |
-| `turn.completed` | End of turn, contains `usage` metrics |
-| `turn.failed` | Turn failure, contains `error` details |
-| `item.started` | Item creation started |
-| `item.updated` | Item content updated (streaming) |
-| `item.completed` | Item finalized |
-| `error` | Unrecoverable error |
-
-### Item Types
-
-Items within `item.*` events have these types:
-
-| Item Type | Description |
-|-----------|-------------|
-| `agent_message` | Natural language response from the assistant |
-| `reasoning` | Summary of the assistant's thinking process |
-| `command_execution` | Shell command executed by the assistant |
-| `file_change` | File modification made by the assistant |
-| `mcp_tool_call` | Model Context Protocol tool invocation |
-| `web_search` | Web search operation |
-| `todo_list` | Agent's running plan |
-
-### Event Structures
-
-#### thread.started
-```json
-{
-  "type": "thread.started",
-  "thread_id": "019b3cf8-21e8-7430-9ca3-4d38435173e4"
+for event := range streamResp.Stream {
+    if delta, ok := event.(*api.TextDeltaEvent); ok {
+        fmt.Print(delta.TextDelta)
+    }
 }
 ```
 
-#### item.completed
+### Example Output
+
 ```json
-{
-  "type": "item.completed",
-  "item": {
-    "id": "item_1",
-    "type": "agent_message",
-    "text": "The response text"
-  }
-}
+{"method":"item/agentMessage/delta","params":{"delta":"4"}}
+{"method":"turn/completed","params":{"usage":{"inputTokens":4972,"outputTokens":9}}}
 ```
 
-#### turn.completed
-```json
-{
-  "type": "turn.completed",
-  "usage": {
-    "input_tokens": 4972,
-    "cached_input_tokens": 0,
-    "output_tokens": 9
-  }
-}
-```
+## Streaming Modes
 
-#### error
-```json
-{
-  "type": "error",
-  "message": "Error description"
-}
-```
+The provider uses the **app-server** mode for true streaming:
 
-## Streaming via App-Server Protocol
-
-The `codex exec --json` mode only provides `item.completed` events (no incremental streaming). For true token-by-token streaming, use the **app-server** JSON-RPC protocol:
+### App-Server Protocol (Default)
 
 ```bash
 codex app-server
 ```
 
-### App-Server Protocol
+- **Protocol**: JSON-RPC 2.0 over stdio
+- **Streaming**: Token-by-token delta events (`item/agentMessage/delta`)
+- **Sessions**: Persistent threads for multi-turn conversations
+- **Performance**: Low latency, efficient for interactive use
 
-The app-server uses JSON-RPC 2.0 over stdio. Initialize, start a thread, then start a turn:
-
-```json
-{"jsonrpc":"2.0","method":"initialize","params":{"clientInfo":{"name":"goai","version":"1.0"}},"id":0}
-{"jsonrpc":"2.0","method":"thread/start","params":{},"id":1}
-{"jsonrpc":"2.0","method":"turn/start","params":{"threadId":"<from thread/start>","input":[{"type":"text","text":"Hello"}],"approvalPolicy":"never"},"id":2}
-```
-
-### Streaming Delta Events
-
-The app-server emits incremental delta events:
-
-| Event Method | Description | Payload |
-|--------------|-------------|---------|
-| `item/agentMessage/delta` | Agent response text delta | `{itemId, delta}` |
-| `item/reasoning/summaryTextDelta` | Reasoning text delta | `{itemId, delta, summaryIndex}` |
-| `item/started` | Item creation started | `{item}` |
-| `item/completed` | Item finalized | `{item}` |
-| `turn/started` | Turn began | `{turn}` |
-| `turn/completed` | Turn finished | `{turn, usage}` |
-| `thread/started` | Thread initialized | `{thread}` |
-
-### Example Streaming Output
-
-```
->>> initialize
-<<< {"id":0,"result":{"userAgent":"codex_cli_rs/0.63.0..."}}
-
->>> thread/start
-<<< {"id":1,"result":{"thread":{"id":"019b..."},"model":"gpt-5.2-codex-max"}}
-<<< {"method":"thread/started","params":{...}}
-
->>> turn/start
-<<< {"method":"turn/started","params":{...}}
-<<< {"method":"item/started","params":{"item":{"type":"reasoning",...}}}
-<<< {"method":"item/reasoning/summaryTextDelta","params":{"delta":"**Thinking"}}
-<<< {"method":"item/reasoning/summaryTextDelta","params":{"delta":" about"}}
-<<< {"method":"item/completed","params":{"item":{"type":"reasoning",...}}}
-<<< {"method":"item/started","params":{"item":{"type":"agentMessage",...}}}
-<<< {"method":"item/agentMessage/delta","params":{"delta":"Hello"}}
-<<< {"method":"item/agentMessage/delta","params":{"delta":" there"}}
-<<< {"method":"item/agentMessage/delta","params":{"delta":" friend"}}
-<<< {"method":"item/completed","params":{"item":{"type":"agentMessage","text":"Hello there friend"}}}
-<<< {"method":"turn/completed","params":{"usage":{"inputTokens":...,"outputTokens":...}}}
-```
-
-### Protocol Schema
-
-Generate JSON schemas for the full protocol:
-
-```bash
-codex app-server generate-json-schema --out ./schemas
-ls schemas/v2/  # AgentMessageDeltaNotification.json, etc.
-```
-
-### Streaming vs Exec Mode
-
-| Feature | `codex exec --json` | `codex app-server` |
-|---------|--------------------|--------------------|
-| Token streaming | ❌ (completed only) | ✅ (delta events) |
-| Protocol | Simple JSONL | JSON-RPC 2.0 |
-| Session model | One-shot | Persistent threads |
-| Multi-turn | Resume by ID | Same thread |
-| Complexity | Simple | More complex |
-
-**Recommendation**: Use `app-server` for streaming, `exec` for simple one-shot queries.
-
-## Comparison with Claude CLI
+### Key Differences from Claude CLI
 
 | Feature | Claude CLI | Codex CLI |
 |---------|-----------|-----------|
 | Command | `claude` | `codex` |
-| Auth command | `claude login` | `codex login` |
-| Auth method | Anthropic OAuth | ChatGPT OAuth |
-| Non-interactive | `-p` flag | `exec` subcommand |
-| Input format | `--input-format stream-json` | Prompt as argument |
-| Output format | `--output-format stream-json` | `--json` flag |
-| Session model | Stdin-based streaming | One-shot execution |
-| Event: init | `{"type":"system","subtype":"init"}` | `{"type":"thread.started"}` |
-| Event: content | `{"type":"assistant","message":{}}` | `{"type":"item.completed","item":{}}` |
-| Event: result | `{"type":"result"}` | `{"type":"turn.completed"}` |
+| Auth | Anthropic OAuth | ChatGPT OAuth |
+| Streaming mode | `-p --output-format stream-json` | `app-server` (JSON-RPC) |
+| Session model | Stdin streaming | Persistent threads |
+| Event format | JSONL | JSON-RPC notifications |
+
+## Implementation Details
+
+The provider follows the same architecture pattern as `anthropic-claudecode`:
+
+- **Process Management**: Persistent `codex app-server` subprocess with automatic restart
+- **JSON-RPC Communication**: Request/response with notification stream handling
+- **Response Decoding**: Converts JSON-RPC notifications to `api.StreamEvent`
+- **Codec Layer**: Separate encoding (`api.Message` → JSON-RPC) and decoding (JSON-RPC → `api.Response`)
+
+For implementation details, see the [package documentation](https://pkg.go.dev/github.com/jetify-com/goai/provider/openai-codex).
+
+## Package Structure
+
+```
+provider/openai-codex/
+├── llm.go              # LanguageModel implementation
+├── codec/
+│   ├── events.go       # Event type definitions
+│   ├── encode.go       # api.Message → JSON-RPC
+│   ├── decode.go       # JSON-RPC → api.Response
+│   ├── decode_appserver.go # App-server notification decoding
+│   └── metadata.go     # Provider-specific metadata
+└── process/
+    ├── interface.go    # AppServer interface
+    ├── appserver.go    # Implementation
+    └── mock.go         # MockAppServer for testing
+```
+
+## Testing
+
+### Unit Tests
+
+Run unit tests with mock process (no CLI required):
+
+```bash
+go test ./provider/openai-codex/...
+```
+
+### Integration Tests
+
+Integration tests require the `codex` CLI installed and configured:
+
+```bash
+# Skip integration tests (default)
+go test ./provider/openai-codex/...
+
+# Run integration tests
+go test ./provider/openai-codex -tags=integration -v
+```
+
+**Requirements for integration tests**:
+- `codex` CLI installed ([installation guide](https://developers.openai.com/codex/cli/))
+- Authenticated via `codex login`
+- ChatGPT subscription with access to codex models
+
+## Error Handling
+
+The provider includes robust error handling with user-friendly messages and automatic classification.
+
+### Error Classification
+
+Errors are automatically classified into categories with actionable guidance:
+
+```go
+import codex "github.com/jetify-com/goai/provider/openai-codex"
+
+model := codex.NewLanguageModel("gpt-5.2-codex-max")
+resp, err := model.Generate(ctx, prompt, api.CallOptions{})
+
+if err != nil {
+    // Errors are automatically classified
+    errInfo, ok := err.(*codex.ErrorInfo)
+    if ok {
+        fmt.Printf("Category: %s\n", errInfo.Category)
+        fmt.Printf("Message: %s\n", errInfo.UserMessage)
+        fmt.Printf("Action: %s\n", errInfo.SuggestedAction)
+        fmt.Printf("Retryable: %v\n", errInfo.Retryable)
+    }
+}
+```
+
+### Error Categories
+
+| Category | Retryable | Common Causes | Suggested Action |
+|----------|-----------|---------------|------------------|
+| `quota_exceeded` | No | API credits exhausted | Add credits at platform.openai.com/account/billing |
+| `rate_limited` | Yes | Too many requests | Wait before retrying or reduce frequency |
+| `authentication_failed` | No | Invalid credentials | Run 'codex login' to authenticate |
+| `service_unavailable` | Yes | Temporary outage | Retry in a few moments |
+| `model_not_available` | No | Invalid model ID | Check model availability |
+| `process_failure` | Yes | CLI not found | Ensure 'codex' CLI is installed |
+
+### Retry Logic
+
+Automatic retry with exponential backoff for transient failures:
+
+```go
+retryPolicy := codex.NewRetryPolicy(
+    codex.WithMaxAttempts(3),
+    codex.WithInitialDelay(time.Second),
+    codex.WithMaxDelay(60 * time.Second),
+    codex.WithMultiplier(2.0),
+    codex.WithJitter(true),
+)
+
+model := codex.NewLanguageModel("gpt-5.2-codex-max",
+    codex.WithRetryPolicy(retryPolicy),
+)
+
+// Automatic retries on rate limits, service unavailability, etc.
+resp, err := model.Generate(ctx, prompt, api.CallOptions{})
+```
+
+**Retry Behavior**:
+- Retries only on transient failures (rate limits, service issues)
+- Exponential backoff: 1s → 2s → 4s (with jitter)
+- Respects context cancellation
+- Non-retryable errors fail immediately
+
+## Cost Monitoring
+
+Track token usage and enforce budget limits to prevent unexpected costs.
+
+### Basic Usage
+
+```go
+// Create cost monitor with 100K token budget
+monitor := codex.NewCostMonitor(100_000,
+    codex.WithWarningThreshold(0.8), // Alert at 80%
+    codex.WithAlertCallback(func(alert codex.CostAlert) {
+        log.Printf("ALERT: Used %d/%d tokens (%.1f%%)",
+            alert.Used, alert.Budget, alert.Percent*100)
+    }),
+)
+
+model := codex.NewLanguageModel("gpt-5.2-codex-max",
+    codex.WithCostMonitor(monitor),
+)
+
+// Usage is tracked automatically
+resp, err := model.Generate(ctx, prompt, api.CallOptions{})
+if err != nil {
+    // Budget exceeded errors are caught here
+    return err
+}
+
+// Check current usage
+stats := monitor.Usage()
+fmt.Printf("Used: %d/%d tokens (%.1f%% remaining)\n",
+    stats.Used, stats.Budget, float64(stats.Remaining)/float64(stats.Budget)*100)
+```
+
+### Alert Types
+
+**Warning Alert** (default: 80% of budget):
+```go
+monitor := codex.NewCostMonitor(100_000,
+    codex.WithAlertCallback(func(alert codex.CostAlert) {
+        if alert.AlertType == codex.AlertTypeWarning {
+            // Notify user approaching limit
+            log.Printf("WARNING: %d%% of budget used", int(alert.Percent*100))
+        }
+    }),
+)
+```
+
+**Critical Alert** (budget exceeded):
+```go
+monitor := codex.NewCostMonitor(100_000,
+    codex.WithAlertCallback(func(alert codex.CostAlert) {
+        if alert.AlertType == codex.AlertTypeCritical {
+            // Budget exceeded - requests will fail
+            log.Printf("CRITICAL: Budget exceeded!")
+            // Trigger notifications, email, etc.
+        }
+    }),
+)
+```
+
+### Usage Statistics
+
+```go
+stats := monitor.Usage()
+
+fmt.Printf("Total: %d tokens\n", stats.Used)
+fmt.Printf("Input: %d tokens\n", stats.InputTokens)
+fmt.Printf("Output: %d tokens\n", stats.OutputTokens)
+fmt.Printf("Remaining: %d tokens\n", stats.Remaining)
+fmt.Printf("Percent: %.1f%%\n", stats.Percent*100)
+fmt.Printf("Duration: %s\n", stats.Duration)
+
+// Check if you can afford an estimated request
+if monitor.CanAfford(5000) {
+    // Safe to make request
+    resp, err := model.Generate(ctx, prompt, api.CallOptions{})
+}
+
+// Reset usage (e.g., monthly reset)
+monitor.Reset()
+```
+
+### Per-User Budgets
+
+```go
+type UserSession struct {
+    userID  string
+    monitor *codex.CostMonitor
+    model   *codex.LanguageModel
+}
+
+func NewUserSession(userID string, budget int) *UserSession {
+    monitor := codex.NewCostMonitor(budget)
+    model := codex.NewLanguageModel("gpt-5.2-codex-max",
+        codex.WithCostMonitor(monitor),
+    )
+
+    return &UserSession{
+        userID:  userID,
+        monitor: monitor,
+        model:   model,
+    }
+}
+
+// Each user has their own budget and tracking
+session := NewUserSession("user-123", 50_000)
+resp, err := session.model.Generate(ctx, prompt, api.CallOptions{})
+```
 
 ## Configuration
+
+### CLI Config File
 
 Config file: `~/.codex/config.toml`
 
@@ -262,181 +372,70 @@ command = "npx"
 args = ["@playwright/mcp@latest"]
 ```
 
-## Implementation Notes
-
-### Provider Design
-
-This provider uses the persistent `codex app-server` mode for true streaming:
-
-1. **Process Management**: Spawn persistent `codex app-server` subprocess
-2. **JSON-RPC Communication**: Send requests, receive notification streams
-3. **Config-Based Restart**: Automatically restart process when config changes
-4. **Response Decoding**: Convert JSON-RPC notifications to `api.StreamEvent`
-
-### Key Differences from claudecode
-
-1. **Two Modes**:
-   - `codex exec --json` for simple one-shot queries (no streaming)
-   - `codex app-server` for streaming via JSON-RPC protocol
-2. **Event Structure**: Different event types and item-based content model
-3. **Usage Location**: Token usage in `turn.completed` rather than in result event
-4. **Session Tracking**: Uses `thread_id` instead of `session_id`
-5. **Streaming Protocol**: JSON-RPC 2.0 vs Claude's simple JSONL streaming
-
-### Mapping to API Types
-
-**For `codex exec` (non-streaming):**
-
-| Codex Event | API Response Field |
-|-------------|-------------------|
-| `item.completed` (agent_message) | `Content` (TextBlock) |
-| `item.completed` (reasoning) | `ProviderMetadata` |
-| `turn.completed.usage` | `Usage` |
-| `thread_id` | `ResponseInfo.ID` |
-| `turn.failed.error` | Return as error |
-
-**For `codex app-server` (streaming):**
-
-| App-Server Event | API StreamEvent |
-|------------------|-----------------|
-| `item/agentMessage/delta` | `TextDeltaEvent{TextDelta: delta}` |
-| `item/reasoning/summaryTextDelta` | (provider metadata or skip) |
-| `item/started` (agentMessage) | `ResponseMetadataEvent` |
-| `item/completed` | (finalize content) |
-| `turn/completed` | `FinishEvent{Usage: ...}` |
-| `turn/failed` | `ErrorEvent` |
-
-## Implementation Patterns (from anthropic-claudecode)
-
-These patterns were established in the `anthropic-claudecode` provider and apply here:
-
-### Package Architecture
-
-```
-provider/openai-codex/
-├── llm.go              # LanguageModel implementation (app-server mode)
-├── llm_test.go         # Unit tests with mock process
-├── integration_test.go # Integration tests (build tag)
-├── codec/
-│   ├── events.go       # JSONL event type definitions
-│   ├── encode.go       # api.Message → CLI input format
-│   ├── decode.go       # CLI output → api.Response
-│   ├── decode_stream.go # Stream event decoding (exec mode)
-│   ├── decode_appserver.go # App-server notification decoding
-│   ├── metadata.go     # Provider-specific metadata
-│   └── jsonrpc/
-│       ├── types.go    # JSON-RPC 2.0 message types
-│       └── client.go   # JSON-RPC client with async message pump
-└── process/
-    ├── interface.go    # Process and AppServer interfaces
-    ├── appserver.go    # App-server process implementation
-    └── mock.go         # MockAppServer for unit tests
-```
-
-### AppServer Interface Pattern
+### Programmatic Configuration
 
 ```go
-type AppServer interface {
-    Process  // Start, Stop, IsRunning, etc.
-    Initialize(ctx context.Context) error
-    StartThread(ctx context.Context) (string, error)
-    StartTurn(ctx context.Context, threadID string, input []Input, policy ApprovalPolicy) error
-    Notifications() <-chan *Notification  // Streaming notifications
-    Client() *jsonrpc.Client
-}
+import (
+    codex "github.com/jetify-com/goai/provider/openai-codex"
+    "github.com/jetify-com/goai/provider/openai-codex/process"
+)
+
+// Create model with advanced options
+model := codex.NewLanguageModel("gpt-5.2-codex-max")
+
+// Configure sandbox mode (restricts file system access)
+process.WithSandboxMode("workspace-write")
+
+// Enable network access and web search
+process.WithNetworkAccess(true)
+process.WithWebSearch(true)
+
+// Configure MCP servers for tool extensions
+process.WithMCPServer("playwright", "npx", "@playwright/mcp@latest")
+process.WithMCPServerEnv("custom-tool", "python",
+    map[string]string{"API_KEY": "secret"},
+    "-m", "custom_tool")
+
+// Set working directory for process isolation
+process.WithWorkDir("/path/to/workspace")
 ```
 
-### Streaming Implementation
+### Advanced Options
 
-Return `iter.Seq[api.StreamEvent]` that reads from notification channel:
+| Option | Type | Description | Default |
+|--------|------|-------------|---------|
+| `SandboxMode` | string | File system access: "workspace-write", "read-only", "no-access" | "" |
+| `SkipGitRepoCheck` | bool | Allow non-git directories | false |
+| `NetworkAccess` | bool | Enable network connectivity | false |
+| `WebSearch` | bool | Enable web search capability | false |
+| `MCPServers` | map | MCP server configurations for tool extensions | nil |
+| `WorkDir` | string | Working directory for process isolation | "" |
+
+**Sandboxing Note**: Unlike the `claude` CLI which has filesystem access to the CWD by default, the `codex app-server` process can be sandboxed by setting `WorkDir` to an isolated directory. For security-sensitive applications, consider:
 
 ```go
-func (d *streamDecoder) decodeEvents() iter.Seq[api.StreamEvent] {
-    return func(yield func(api.StreamEvent) bool) {
-        notifications := d.proc.Notifications()
-
-        for notif := range notifications {
-            event, err := codec.DecodeNotification(notif)
-            if err != nil {
-                yield(&api.ErrorEvent{Err: err})
-                continue
-            }
-
-            if event != nil {
-                if !yield(event) {
-                    return
-                }
-                // turn/completed signals end of stream
-                if _, ok := event.(*api.FinishEvent); ok {
-                    return
-                }
-            }
-        }
-    }
+// Create isolated temp directory for process
+tmpDir, err := os.MkdirTemp("", "codex-sandbox-*")
+if err != nil {
+    return err
 }
+defer os.RemoveAll(tmpDir) // Cleanup
+
+model := codex.NewLanguageModel("gpt-5.2-codex-max",
+    codex.WithAppServer(
+        process.NewAppServerProcess(
+            process.WithWorkDir(tmpDir),
+            process.WithSandboxMode("workspace-write"),
+        ),
+    ),
+)
 ```
 
-### Mock AppServer for Testing
-
-```go
-type MockAppServer struct {
-    notifications chan *jsonrpc.Notification
-    // ...
-}
-
-func (m *MockAppServer) SendNotification(method string, params any) {
-    m.notifications <- &jsonrpc.Notification{Method: method, Params: params}
-}
-
-// In tests:
-mockProc := process.NewMockAppServer()
-mockProc.OnStartThread = func(ctx context.Context) (string, error) {
-    go func() {
-        mockProc.SendNotification("item/agentMessage/delta", codec.TextDeltaParams{
-            ItemID: "item_1", Delta: "Hello world",
-        })
-        mockProc.SendNotification("turn/completed", codec.TurnCompletedParams{
-            Usage: &codec.AppServerUsage{InputTokens: 100, OutputTokens: 10},
-        })
-    }()
-    return "thread-123", nil
-}
-
-model := NewLanguageModel("gpt-5.2-codex-max", WithAppServer(mockProc))
-```
-
-### Integration Tests
-
-Use build tags to separate from unit tests:
-
-```go
-//go:build integration
-
-package codex
-
-// Run with: go test ./provider/openai-codex -tags=integration -v
-```
-
-### Gotchas from Claude Code Implementation
-
-1. **Response field fallback**: CLI may return text in different fields - implement fallback logic in decoder
-2. **Stream event JSON keys**: The inner event data may use a different JSON key than the outer type
-3. **Nil event handling**: Some stream events (like `content_block_stop`) should return nil and be skipped
-4. **Finish reason mapping**: Map CLI-specific stop reasons to `api.FinishReason` constants
-5. **Provider metadata**: Use `api.NewProviderMetadata(map[string]any{ProviderName: &metadata})` pattern
-
-### Event Flow
-
-```
-CLI stdout → ParseEvent() → DecodeStreamEvent() → yield to iterator
-                                   ↓
-                          (nil for internal events)
-```
+**Note**: Some options may require specific codex CLI versions or additional configuration. Refer to the [Codex CLI documentation](https://developers.openai.com/codex/cli/) for compatibility details.
 
 ## References
 
 - [Codex CLI Documentation](https://developers.openai.com/codex/cli/)
 - [Codex CLI Reference](https://developers.openai.com/codex/cli/reference/)
-- [Codex exec Documentation](https://github.com/openai/codex/blob/main/docs/exec.md)
-- [Codex CLI Features](https://developers.openai.com/codex/cli/features/)
-- [Configuring Codex](https://developers.openai.com/codex/local-config/)
+- [App-Server Protocol](https://github.com/openai/codex/blob/main/docs/app-server.md)
+- [Package Documentation](https://pkg.go.dev/github.com/jetify-com/goai/provider/openai-codex)

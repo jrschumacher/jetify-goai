@@ -256,3 +256,108 @@ func (m *MockAppServer) SendNotification(method string, params any) {
 func (m *MockAppServer) CloseNotifications() {
 	close(m.notifications)
 }
+
+// SimulateQuotaExceeded simulates an API quota exhaustion error.
+func (m *MockAppServer) SimulateQuotaExceeded() {
+	m.OnInitialize = func(ctx context.Context) error {
+		return &jsonrpc.Error{
+			Code:    429,
+			Message: "insufficient_quota: You have exceeded your API quota",
+		}
+	}
+}
+
+// SimulateRateLimit simulates a rate limiting error.
+func (m *MockAppServer) SimulateRateLimit() {
+	m.OnStartTurn = func(ctx context.Context, threadID string, input []jsonrpc.Input, policy jsonrpc.ApprovalPolicy) error {
+		return &jsonrpc.Error{
+			Code:    429,
+			Message: "rate_limit_exceeded: Too many requests",
+		}
+	}
+}
+
+// SimulateAuthFailure simulates an authentication failure.
+func (m *MockAppServer) SimulateAuthFailure() {
+	m.OnInitialize = func(ctx context.Context) error {
+		return &jsonrpc.Error{
+			Code:    401,
+			Message: "authentication_failed: Invalid credentials",
+		}
+	}
+}
+
+// SimulateServiceUnavailable simulates a temporary service outage.
+func (m *MockAppServer) SimulateServiceUnavailable() {
+	m.OnStartThread = func(ctx context.Context) (string, error) {
+		return "", &jsonrpc.Error{
+			Code:    503,
+			Message: "service_unavailable: Temporary outage",
+		}
+	}
+}
+
+// SimulateProcessFailure simulates a process startup failure.
+func (m *MockAppServer) SimulateProcessFailure() {
+	m.OnStart = func(ctx context.Context) error {
+		return &jsonrpc.Error{
+			Code:    jsonrpc.CodeInternalError,
+			Message: "failed to start codex app-server process",
+		}
+	}
+}
+
+// SimulateModelNotAvailable simulates a model unavailability error.
+func (m *MockAppServer) SimulateModelNotAvailable() {
+	m.OnStartThread = func(ctx context.Context) (string, error) {
+		return "", &jsonrpc.Error{
+			Code:    jsonrpc.CodeInvalidParams,
+			Message: "model not found: requested model is not available",
+		}
+	}
+}
+
+// SimulateSuccess simulates a successful request with a response.
+func (m *MockAppServer) SimulateSuccess(threadID, response string, inputTokens, outputTokens int) {
+	m.OnStartThread = func(ctx context.Context) (string, error) {
+		return threadID, nil
+	}
+
+	m.OnStartTurn = func(ctx context.Context, tid string, input []jsonrpc.Input, policy jsonrpc.ApprovalPolicy) error {
+		// Send agent message delta
+		m.SendNotification("item/agentMessage/delta", map[string]any{
+			"itemId": "msg-1",
+			"delta":  response,
+		})
+
+		// Send turn completed
+		m.SendNotification("turn/completed", map[string]any{
+			"usage": map[string]int{
+				"inputTokens":  inputTokens,
+				"outputTokens": outputTokens,
+			},
+		})
+
+		// Close notifications to signal completion
+		go func() {
+			m.CloseNotifications()
+		}()
+
+		return nil
+	}
+}
+
+// SimulateTransientFailure simulates a failure that succeeds on retry.
+func (m *MockAppServer) SimulateTransientFailure(failCount int) {
+	attempts := 0
+	m.OnStartThread = func(ctx context.Context) (string, error) {
+		attempts++
+		if attempts <= failCount {
+			return "", &jsonrpc.Error{
+				Code:    503,
+				Message: "service_unavailable: Temporary failure",
+			}
+		}
+		return "thread-1", nil
+	}
+}
