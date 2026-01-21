@@ -84,7 +84,7 @@ func (m *LanguageModel) Generate(
 
 	// Ensure cleanup of locally-created process
 	if ownsProc {
-		defer proc.Stop()
+		defer func() { _ = proc.Stop() }()
 	}
 
 	// Start the process if not running
@@ -175,7 +175,7 @@ func (m *LanguageModel) Stream(
 	if !proc.IsRunning() {
 		if err := proc.Start(ctx); err != nil {
 			if ownsProc {
-				proc.Stop()
+				_ = proc.Stop()
 			}
 			return nil, fmt.Errorf("failed to start CLI process: %w", err)
 		}
@@ -185,7 +185,7 @@ func (m *LanguageModel) Stream(
 	stdin := proc.Stdin()
 	if stdin == nil {
 		if ownsProc {
-			proc.Stop()
+			_ = proc.Stop()
 		}
 		return nil, fmt.Errorf("process stdin not available")
 	}
@@ -193,13 +193,13 @@ func (m *LanguageModel) Stream(
 		encoded, err := codec.EncodeMessage(msg)
 		if err != nil {
 			if ownsProc {
-				proc.Stop()
+				_ = proc.Stop()
 			}
 			return nil, fmt.Errorf("failed to encode message: %w", err)
 		}
 		if _, err := stdin.Write(append(encoded, '\n')); err != nil {
 			if ownsProc {
-				proc.Stop()
+				_ = proc.Stop()
 			}
 			return nil, fmt.Errorf("failed to write to CLI: %w", err)
 		}
@@ -233,7 +233,7 @@ func (d *streamDecoder) decodeEvents() iter.Seq[api.StreamEvent] {
 	return func(yield func(api.StreamEvent) bool) {
 		// Ensure cleanup when iterator finishes (either normally or early exit)
 		if d.ownsProc {
-			defer d.proc.Stop()
+			defer func() { _ = d.proc.Stop() }()
 		}
 
 		// Check for context cancellation before starting
