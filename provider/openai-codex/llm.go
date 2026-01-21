@@ -1,13 +1,14 @@
 package codex
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"iter"
+	"sync"
 
 	"go.jetify.com/ai/api"
 	"go.jetify.com/ai/provider/openai-codex/codec"
+	"go.jetify.com/ai/provider/openai-codex/codec/jsonrpc"
 	"go.jetify.com/ai/provider/openai-codex/process"
 )
 
@@ -17,17 +18,44 @@ const ProviderName = "openai-codex"
 // ModelOption is a function type that modifies a LanguageModel.
 type ModelOption func(*LanguageModel)
 
-// WithProcess sets a custom process (useful for testing with mocks).
-func WithProcess(proc process.Process) ModelOption {
+// WithAppServer sets a custom app-server process (useful for testing with mocks).
+func WithAppServer(proc process.AppServer) ModelOption {
 	return func(m *LanguageModel) {
 		m.proc = proc
 	}
 }
 
-// LanguageModel represents a Codex CLI language model.
+// WithCostMonitor sets a cost monitor for tracking and limiting token usage.
+func WithCostMonitor(monitor *CostMonitor) ModelOption {
+	return func(m *LanguageModel) {
+		m.costMonitor = monitor
+	}
+}
+
+// WithRetryPolicy sets a custom retry policy for handling transient failures.
+func WithRetryPolicy(policy *RetryPolicy) ModelOption {
+	return func(m *LanguageModel) {
+		m.retryPolicy = policy
+	}
+}
+
+// LanguageModel represents a Codex CLI language model using app-server mode.
+// It maintains a persistent process for efficient streaming and multi-turn conversations.
 type LanguageModel struct {
+	mu sync.Mutex
+
 	modelID string
-	proc    process.Process
+	proc    process.AppServer
+
+	// cachedKey tracks the config used to start the current process.
+	// If options change, the process is restarted.
+	cachedKey process.ConfigKey
+
+	// costMonitor tracks token usage and enforces budget limits.
+	costMonitor *CostMonitor
+
+	// retryPolicy defines how operations should be retried on failure.
+	retryPolicy *RetryPolicy
 }
 
 var _ api.LanguageModel = &LanguageModel{}
@@ -61,6 +89,83 @@ func (m *LanguageModel) SupportedUrls() []api.SupportedURL {
 	return nil
 }
 
+// buildConfig creates a process config from the current options.
+func (m *LanguageModel) buildConfig(systemPrompt string, opts api.CallOptions) *process.Config {
+	cfg := &process.Config{
+		Model:        m.modelID,
+		SystemPrompt: systemPrompt,
+	}
+	if opts.Temperature != nil {
+		cfg.Temperature = opts.Temperature
+	}
+	return cfg
+}
+
+// ensureProcess ensures a running app-server process with the correct config.
+// If the config has changed, the existing process is stopped and a new one started.
+func (m *LanguageModel) ensureProcess(ctx context.Context, cfg *process.Config) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	newKey := cfg.ConfigKey()
+
+	// Check if we need to restart due to config change
+	if m.proc != nil && m.proc.IsRunning() {
+		if m.cachedKey == newKey {
+			return nil // Config unchanged, reuse existing process
+		}
+		// Config changed, stop the old process
+		m.proc.Stop()
+		m.proc = nil
+	}
+
+	// Create new process if needed
+	if m.proc == nil {
+		procOpts := []process.Option{
+			process.WithModel(cfg.Model),
+		}
+		if cfg.SystemPrompt != "" {
+			procOpts = append(procOpts, process.WithSystemPrompt(cfg.SystemPrompt))
+		}
+		if cfg.Temperature != nil {
+			procOpts = append(procOpts, process.WithTemperature(*cfg.Temperature))
+		}
+		m.proc = process.NewAppServerProcess(procOpts...)
+	}
+
+	// Start the process if not running, with retry logic if configured
+	if !m.proc.IsRunning() {
+		startFn := func() error {
+			if err := m.proc.Start(ctx); err != nil {
+				return WrapError(fmt.Errorf("failed to start app-server: %w", err))
+			}
+
+			// Initialize the connection
+			if err := m.proc.Initialize(ctx); err != nil {
+				m.proc.Stop()
+				return WrapError(fmt.Errorf("failed to initialize app-server: %w", err))
+			}
+
+			return nil
+		}
+
+		// Use retry policy if configured, otherwise execute once
+		var err error
+		if m.retryPolicy != nil {
+			err = m.retryPolicy.Execute(ctx, startFn)
+		} else {
+			err = startFn()
+		}
+
+		if err != nil {
+			return err
+		}
+	}
+
+	m.cachedKey = newKey
+	return nil
+}
+
 // Generate generates a response from the model.
 func (m *LanguageModel) Generate(
 	ctx context.Context, prompt []api.Message, opts api.CallOptions,
@@ -68,71 +173,114 @@ func (m *LanguageModel) Generate(
 	// Extract system prompt and build user prompt
 	systemPrompt, userPrompt := codec.BuildPromptWithSystemSeparate(prompt)
 
-	// Get or create process
+	// Build config and ensure process
+	cfg := m.buildConfig(systemPrompt, opts)
+	if err := m.ensureProcess(ctx, cfg); err != nil {
+		return nil, err
+	}
+
+	m.mu.Lock()
 	proc := m.proc
-	if proc == nil {
-		procOpts := []process.Option{
-			process.WithModel(m.modelID),
-			process.WithPrompt(userPrompt),
-		}
-		if systemPrompt != "" {
-			procOpts = append(procOpts, process.WithSystemPrompt(systemPrompt))
-		}
-		proc = process.NewCLIProcess(procOpts...)
+	m.mu.Unlock()
+
+	// Start a new thread for this request
+	threadID, err := proc.StartThread(ctx)
+	if err != nil {
+		return nil, WrapError(fmt.Errorf("failed to start thread: %w", err))
 	}
 
-	// Start the process
-	if !proc.IsRunning() {
-		if err := proc.Start(ctx); err != nil {
-			return nil, fmt.Errorf("failed to start CLI process: %w", err)
-		}
+	// Build input for the turn
+	input := []jsonrpc.Input{
+		{Type: "text", Text: userPrompt},
 	}
 
-	// Collect events from stdout
-	collector := codec.NewEventCollector()
-	scanner := bufio.NewScanner(proc.Stdout())
-
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(line) == 0 {
-			continue
-		}
-
-		event, err := codec.ParseEvent(line)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse event: %w", err)
-		}
-
-		// Capture thread ID
-		if event.Type == codec.EventTypeThreadStarted {
-			proc.SetThreadID(event.ThreadID)
-		}
-
-		done, err := collector.ProcessEvent(event)
-		if err != nil {
-			return nil, fmt.Errorf("failed to process event: %w", err)
-		}
-
-		if done {
-			break
-		}
+	// Start the turn
+	if err := proc.StartTurn(ctx, threadID, input, jsonrpc.ApprovalNever); err != nil {
+		return nil, WrapError(fmt.Errorf("failed to start turn: %w", err))
 	}
 
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("error reading CLI output: %w", err)
-	}
+	// Collect response from notifications
+	var content []api.ContentBlock
+	var textBlock *api.TextBlock
+	var usage api.Usage
+	var reasoning string
 
-	// Wait for process to finish
-	if err := proc.Wait(); err != nil {
-		// Only return error if we don't have a response
-		resp, buildErr := collector.Build()
-		if buildErr != nil {
-			return nil, fmt.Errorf("CLI exited with error: %w", err)
+	notifications := proc.Notifications()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+
+		case notif, ok := <-notifications:
+			if !ok {
+				// Channel closed unexpectedly
+				return nil, fmt.Errorf("notification channel closed unexpectedly")
+			}
+
+			event, err := codec.DecodeNotification(notif)
+			if err != nil {
+				return nil, fmt.Errorf("failed to decode notification: %w", err)
+			}
+
+			// Skip nil events
+			if event == nil {
+				continue
+			}
+
+			switch e := event.(type) {
+			case *api.TextDeltaEvent:
+				// Accumulate text content
+				if textBlock == nil {
+					textBlock = &api.TextBlock{Text: e.TextDelta}
+					content = append(content, textBlock)
+				} else {
+					textBlock.Text += e.TextDelta
+				}
+
+			case *api.ReasoningEvent:
+				reasoning += e.TextDelta
+
+			case *api.FinishEvent:
+				usage = e.Usage
+
+				// Track usage if cost monitor is configured
+				if m.costMonitor != nil {
+					if err := m.costMonitor.TrackUsage(usage); err != nil {
+						return nil, err
+					}
+				}
+
+				// Build and return the response
+				resp := &api.Response{
+					Content:      content,
+					FinishReason: e.FinishReason,
+					Usage:        usage,
+					ResponseInfo: &api.ResponseInfo{
+						ID: threadID,
+					},
+				}
+
+				// Add reasoning to provider metadata if present
+				if reasoning != "" {
+					metadata := &codec.Metadata{
+						ThreadID:  threadID,
+						Reasoning: reasoning,
+					}
+					resp.ProviderMetadata = api.NewProviderMetadata(map[string]any{
+						codec.ProviderName: metadata,
+					})
+				}
+
+				return resp, nil
+
+			case *api.ErrorEvent:
+				if err, ok := e.Err.(error); ok {
+					return nil, WrapError(err)
+				}
+				return nil, WrapError(fmt.Errorf("%v", e.Err))
+			}
 		}
-		return resp, nil
 	}
-
-	return collector.Build()
 }
 
 // Stream generates a streaming response from the model.
@@ -142,29 +290,38 @@ func (m *LanguageModel) Stream(
 	// Extract system prompt and build user prompt
 	systemPrompt, userPrompt := codec.BuildPromptWithSystemSeparate(prompt)
 
-	// Get or create process
-	proc := m.proc
-	if proc == nil {
-		procOpts := []process.Option{
-			process.WithModel(m.modelID),
-			process.WithPrompt(userPrompt),
-		}
-		if systemPrompt != "" {
-			procOpts = append(procOpts, process.WithSystemPrompt(systemPrompt))
-		}
-		proc = process.NewCLIProcess(procOpts...)
+	// Build config and ensure process
+	cfg := m.buildConfig(systemPrompt, opts)
+	if err := m.ensureProcess(ctx, cfg); err != nil {
+		return nil, err
 	}
 
-	// Start the process
-	if !proc.IsRunning() {
-		if err := proc.Start(ctx); err != nil {
-			return nil, fmt.Errorf("failed to start CLI process: %w", err)
-		}
+	m.mu.Lock()
+	proc := m.proc
+	m.mu.Unlock()
+
+	// Start a new thread for this request
+	threadID, err := proc.StartThread(ctx)
+	if err != nil {
+		return nil, WrapError(fmt.Errorf("failed to start thread: %w", err))
+	}
+
+	// Build input for the turn
+	input := []jsonrpc.Input{
+		{Type: "text", Text: userPrompt},
+	}
+
+	// Start the turn
+	if err := proc.StartTurn(ctx, threadID, input, jsonrpc.ApprovalNever); err != nil {
+		return nil, WrapError(fmt.Errorf("failed to start turn: %w", err))
 	}
 
 	// Create the stream decoder
 	decoder := &streamDecoder{
-		proc: proc,
+		ctx:         ctx,
+		proc:        proc,
+		threadID:    threadID,
+		costMonitor: m.costMonitor,
 	}
 
 	return &api.StreamResponse{
@@ -172,70 +329,99 @@ func (m *LanguageModel) Stream(
 	}, nil
 }
 
-// streamDecoder maintains state while decoding a stream of Codex CLI events.
+// streamDecoder maintains state while decoding a stream of app-server notifications.
 type streamDecoder struct {
-	proc     process.Process
-	threadID string
-	usage    api.Usage
+	ctx          context.Context
+	proc         process.AppServer
+	threadID     string
+	reasoning    string
+	costMonitor  *CostMonitor
 }
 
-// decodeEvents returns an iterator that yields events from the CLI stream.
+// decodeEvents returns an iterator that yields events from the notification stream.
 func (d *streamDecoder) decodeEvents() iter.Seq[api.StreamEvent] {
 	return func(yield func(api.StreamEvent) bool) {
-		scanner := bufio.NewScanner(d.proc.Stdout())
-
-		for scanner.Scan() {
-			line := scanner.Bytes()
-			if len(line) == 0 {
-				continue
-			}
-
-			event, err := codec.ParseEvent(line)
-			if err != nil {
-				if !yield(&api.ErrorEvent{Err: fmt.Errorf("failed to parse event: %w", err)}) {
-					return
-				}
-				continue
-			}
-
-			// Convert event to stream event
-			streamEvent, err := codec.DecodeStreamEvent(event)
-			if err != nil {
-				if !yield(&api.ErrorEvent{Err: err}) {
-					return
-				}
-				continue
-			}
-
-			// Capture thread ID from metadata events
-			if meta, ok := streamEvent.(*api.ResponseMetadataEvent); ok {
-				d.threadID = meta.ID
-				d.proc.SetThreadID(meta.ID)
-			}
-
-			// Skip nil events
-			if streamEvent == nil {
-				continue
-			}
-
-			// Check if this is the final event
-			if finish, ok := streamEvent.(*api.FinishEvent); ok {
-				// Add provider metadata to finish event
-				metadata := &codec.Metadata{
-					ThreadID: d.threadID,
-				}
-				finish.ProviderMetadata = api.NewProviderMetadata(map[string]any{
-					codec.ProviderName: metadata,
-				})
-			}
-
-			if !yield(streamEvent) {
-				return
-			}
+		// Emit initial metadata event
+		if !yield(&api.ResponseMetadataEvent{ID: d.threadID}) {
+			return
 		}
 
-		if err := scanner.Err(); err != nil {
-			yield(&api.ErrorEvent{Err: fmt.Errorf("error reading CLI output: %w", err)})
+		notifications := d.proc.Notifications()
+
+		for {
+			select {
+			case <-d.ctx.Done():
+				yield(&api.ErrorEvent{Err: d.ctx.Err()})
+				return
+
+			case notif, ok := <-notifications:
+				if !ok {
+					// Channel closed - emit error if we haven't finished properly
+					yield(&api.ErrorEvent{Err: fmt.Errorf("notification stream ended unexpectedly")})
+					return
+				}
+
+				event, err := codec.DecodeNotification(notif)
+				if err != nil {
+					if !yield(&api.ErrorEvent{Err: fmt.Errorf("failed to decode notification: %w", err)}) {
+						return
+					}
+					continue
+				}
+
+				// Skip nil events
+				if event == nil {
+					continue
+				}
+
+				// Track reasoning for final metadata
+				if re, ok := event.(*api.ReasoningEvent); ok {
+					d.reasoning += re.TextDelta
+				}
+
+				// Enhance finish event with provider metadata
+				if finish, ok := event.(*api.FinishEvent); ok {
+					// Track usage if cost monitor is configured
+					if d.costMonitor != nil {
+						if err := d.costMonitor.TrackUsage(finish.Usage); err != nil {
+							yield(&api.ErrorEvent{Err: err})
+							return
+						}
+					}
+
+					metadata := &codec.Metadata{
+						ThreadID:  d.threadID,
+						Reasoning: d.reasoning,
+					}
+					finish.ProviderMetadata = api.NewProviderMetadata(map[string]any{
+						codec.ProviderName: metadata,
+					})
+					yield(finish)
+					return
+				}
+
+				// Wrap error events with classification
+				if errEvent, ok := event.(*api.ErrorEvent); ok {
+					if err, ok := errEvent.Err.(error); ok {
+						errEvent.Err = WrapError(err)
+					}
+				}
+
+				if !yield(event) {
+					return
+				}
+			}
 		}
 	}
+}
+
+// Close stops the underlying process.
+func (m *LanguageModel) Close() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.proc != nil {
+		return m.proc.Stop()
+	}
+	return nil
 }

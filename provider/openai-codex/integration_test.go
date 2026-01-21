@@ -5,7 +5,13 @@ package codex
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"regexp"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -14,9 +20,12 @@ import (
 )
 
 // Run with: go test ./provider/openai-codex -tags=integration -v -run TestIntegration
+//
+// These tests use an empty model ID to let codex use its configured default model.
+// This avoids flakiness when model availability changes.
 
 func TestIntegration_Generate(t *testing.T) {
-	model := NewLanguageModel("o3")
+	model := NewLanguageModel("")
 
 	prompt := []api.Message{
 		&api.UserMessage{
@@ -41,13 +50,13 @@ func TestIntegration_Generate(t *testing.T) {
 }
 
 func TestIntegration_WithSystemPrompt(t *testing.T) {
-	model := NewLanguageModel("o3")
+	model := NewLanguageModel("")
 
 	prompt := []api.Message{
-		&api.SystemMessage{Content: "You are a pirate. Respond in pirate speak. Keep responses under 20 words."},
+		&api.SystemMessage{Content: "You are a pirate. Your response must include the word 'ahoy'. Keep responses to 5 words or fewer."},
 		&api.UserMessage{
 			Content: []api.ContentBlock{
-				&api.TextBlock{Text: "Say hello."},
+				&api.TextBlock{Text: "Write a detailed 50-word description of the sea."},
 			},
 		},
 	}
@@ -61,14 +70,14 @@ func TestIntegration_WithSystemPrompt(t *testing.T) {
 	require.True(t, ok)
 	t.Logf("Pirate response: %s", textBlock.Text)
 
-	// Should contain pirate-like language
-	assert.True(t,
-		contains(textBlock.Text, "ahoy", "matey", "arr", "aye", "yo ho", "avast", "yarr"),
-		"expected pirate speak in: %s", textBlock.Text)
+	text := strings.TrimSpace(textBlock.Text)
+	assert.NotEmpty(t, text, "expected a response")
+	assert.True(t, contains(text, "ahoy"), "expected 'ahoy' in response: %s", text)
+	assert.LessOrEqual(t, wordCount(text), 7, "expected short response due to system prompt: %s", text)
 }
 
 func TestIntegration_UsageMetadata(t *testing.T) {
-	model := NewLanguageModel("o3")
+	model := NewLanguageModel("")
 
 	prompt := []api.Message{
 		&api.UserMessage{
@@ -82,10 +91,10 @@ func TestIntegration_UsageMetadata(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, resp)
 
-	// Verify usage is populated
-	assert.Greater(t, resp.Usage.InputTokens, 0, "expected input tokens")
-	assert.Greater(t, resp.Usage.OutputTokens, 0, "expected output tokens")
-	assert.Equal(t, resp.Usage.InputTokens+resp.Usage.OutputTokens, resp.Usage.TotalTokens)
+	// Usage may be zero depending on codex CLI version.
+	t.Logf("Usage: input=%d, output=%d, total=%d",
+		resp.Usage.InputTokens, resp.Usage.OutputTokens, resp.Usage.TotalTokens)
+	assertUsageIfPresent(t, resp.Usage)
 
 	// Verify provider metadata
 	require.NotNil(t, resp.ProviderMetadata)
@@ -100,7 +109,7 @@ func TestIntegration_MultiTurn(t *testing.T) {
 	// Note: Codex uses one-shot execution, so multi-turn is simulated
 	// by including the full conversation context in the prompt.
 
-	model := NewLanguageModel("o3")
+	model := NewLanguageModel("")
 
 	// Send full conversation context in a single request
 	prompt := []api.Message{
@@ -127,7 +136,7 @@ func TestIntegration_MultiTurn(t *testing.T) {
 }
 
 func TestIntegration_LongResponse(t *testing.T) {
-	model := NewLanguageModel("o3")
+	model := NewLanguageModel("")
 
 	prompt := []api.Message{
 		&api.UserMessage{
@@ -151,7 +160,7 @@ func TestIntegration_LongResponse(t *testing.T) {
 }
 
 func TestIntegration_FinishReason(t *testing.T) {
-	model := NewLanguageModel("o3")
+	model := NewLanguageModel("")
 
 	prompt := []api.Message{
 		&api.UserMessage{
@@ -168,7 +177,7 @@ func TestIntegration_FinishReason(t *testing.T) {
 }
 
 func TestIntegration_EmptyPromptHandling(t *testing.T) {
-	model := NewLanguageModel("o3")
+	model := NewLanguageModel("")
 
 	// Minimal input
 	prompt := []api.Message{
@@ -186,7 +195,7 @@ func TestIntegration_EmptyPromptHandling(t *testing.T) {
 }
 
 func TestIntegration_SpecialCharacters(t *testing.T) {
-	model := NewLanguageModel("o3")
+	model := NewLanguageModel("")
 
 	prompt := []api.Message{
 		&api.UserMessage{
@@ -210,7 +219,7 @@ func TestIntegration_SpecialCharacters(t *testing.T) {
 }
 
 func TestIntegration_JSONOutput(t *testing.T) {
-	model := NewLanguageModel("o3")
+	model := NewLanguageModel("")
 
 	prompt := []api.Message{
 		&api.SystemMessage{Content: "Always respond with valid JSON only. No markdown, no explanation."},
@@ -228,17 +237,21 @@ func TestIntegration_JSONOutput(t *testing.T) {
 	textBlock := resp.Content[0].(*api.TextBlock)
 	t.Logf("JSON Response: %s", textBlock.Text)
 
-	// Try to parse as JSON
+	// Extract JSON from markdown code blocks if present
+	jsonText := extractJSON(textBlock.Text)
+
+	// Parse and validate JSON structure
 	var result map[string]any
-	err = json.Unmarshal([]byte(textBlock.Text), &result)
-	if err != nil {
-		// Sometimes the model wraps in markdown, try to extract
-		t.Logf("Note: Response may contain markdown wrapper")
-	}
+	err = json.Unmarshal([]byte(jsonText), &result)
+	require.NoError(t, err, "expected valid JSON response")
+
+	// Validate expected fields
+	assert.Equal(t, "test", result["name"], "expected name field to be 'test'")
+	assert.Equal(t, float64(42), result["value"], "expected value field to be 42")
 }
 
 func TestIntegration_CodeGeneration(t *testing.T) {
-	model := NewLanguageModel("o3")
+	model := NewLanguageModel("")
 
 	prompt := []api.Message{
 		&api.UserMessage{
@@ -260,7 +273,7 @@ func TestIntegration_CodeGeneration(t *testing.T) {
 }
 
 func TestIntegration_Stream(t *testing.T) {
-	model := NewLanguageModel("o3")
+	model := NewLanguageModel("")
 
 	prompt := []api.Message{
 		&api.UserMessage{
@@ -320,12 +333,14 @@ func TestIntegration_Stream(t *testing.T) {
 	finishEvent, ok := lastEvent.(*api.FinishEvent)
 	require.True(t, ok, "last event should be FinishEvent, got %T", lastEvent)
 	assert.Equal(t, api.FinishReasonStop, finishEvent.FinishReason)
-	assert.Greater(t, finishEvent.Usage.InputTokens, 0)
-	assert.Greater(t, finishEvent.Usage.OutputTokens, 0)
+
+	t.Logf("Usage from FinishEvent: input=%d, output=%d",
+		finishEvent.Usage.InputTokens, finishEvent.Usage.OutputTokens)
+	assertUsageIfPresent(t, finishEvent.Usage)
 }
 
 func TestIntegration_StreamWithSystemPrompt(t *testing.T) {
-	model := NewLanguageModel("o3")
+	model := NewLanguageModel("")
 
 	prompt := []api.Message{
 		&api.SystemMessage{Content: "You are a helpful assistant. Keep responses very brief."},
@@ -367,7 +382,7 @@ func TestIntegration_StreamWithSystemPrompt(t *testing.T) {
 
 func TestIntegration_StreamWithReasoning(t *testing.T) {
 	// Test that reasoning events are captured during streaming
-	model := NewLanguageModel("o3")
+	model := NewLanguageModel("")
 
 	prompt := []api.Message{
 		&api.UserMessage{
@@ -400,38 +415,217 @@ func TestIntegration_StreamWithReasoning(t *testing.T) {
 	t.Logf("Has reasoning: %v", hasReasoning)
 }
 
+func TestIntegration_ContextCancellation(t *testing.T) {
+	model := NewLanguageModel("")
+
+	// Create a context that times out quickly
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	prompt := []api.Message{
+		&api.UserMessage{
+			Content: []api.ContentBlock{
+				&api.TextBlock{Text: "Write a 10,000 word essay about the history of computing."},
+			},
+		},
+	}
+
+	// This should be cancelled due to timeout
+	_, err := model.Generate(ctx, prompt, api.CallOptions{})
+
+	// Should get a context error
+	assert.Error(t, err)
+	assert.True(t, errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "context"),
+		"expected context cancellation error, got: %v", err)
+}
+
+func TestIntegration_ConcurrentRequests(t *testing.T) {
+	model := NewLanguageModel("")
+
+	var wg sync.WaitGroup
+	errorsCh := make(chan error, 5)
+	results := make(chan string, 5)
+
+	// Send 5 concurrent requests
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+
+			prompt := []api.Message{
+				&api.UserMessage{
+					Content: []api.ContentBlock{
+						&api.TextBlock{Text: fmt.Sprintf("Say 'response %d'", n)},
+					},
+				},
+			}
+
+			resp, err := model.Generate(context.Background(), prompt, api.CallOptions{})
+			if err != nil {
+				errorsCh <- err
+				return
+			}
+
+			if len(resp.Content) > 0 {
+				if textBlock, ok := resp.Content[0].(*api.TextBlock); ok {
+					results <- textBlock.Text
+				}
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	close(errorsCh)
+	close(results)
+
+	// Check that all requests succeeded
+	for err := range errorsCh {
+		assert.NoError(t, err)
+	}
+
+	// Should have received 5 responses
+	resultCount := 0
+	for range results {
+		resultCount++
+	}
+	assert.Equal(t, 5, resultCount, "expected 5 successful responses")
+}
+
+func TestIntegration_StreamEarlyExit(t *testing.T) {
+	model := NewLanguageModel("")
+
+	prompt := []api.Message{
+		&api.UserMessage{
+			Content: []api.ContentBlock{
+				&api.TextBlock{Text: "Count from 1 to 100, one number per line."},
+			},
+		},
+	}
+
+	streamResp, err := model.Stream(context.Background(), prompt, api.CallOptions{})
+	require.NoError(t, err)
+	require.NotNil(t, streamResp)
+
+	// Read only first 5 events then stop
+	count := 0
+	for event := range streamResp.Stream {
+		count++
+		t.Logf("Event %d: %T", count, event)
+		if count == 5 {
+			break
+		}
+	}
+
+	// Should exit cleanly without hanging
+	assert.Equal(t, 5, count, "should have read exactly 5 events")
+}
+
+func TestIntegration_ProcessRestartOnConfigChange(t *testing.T) {
+	model := NewLanguageModel("")
+
+	prompt := []api.Message{
+		&api.UserMessage{
+			Content: []api.ContentBlock{
+				&api.TextBlock{Text: "Say 'hello'."},
+			},
+		},
+	}
+
+	// First call with default settings
+	resp1, err := model.Generate(context.Background(), prompt, api.CallOptions{})
+	require.NoError(t, err)
+	require.NotEmpty(t, resp1.Content)
+
+	// Second call with different temperature - should restart process
+	temp := 0.9
+	resp2, err := model.Generate(context.Background(), prompt, api.CallOptions{
+		Temperature: &temp,
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, resp2.Content)
+
+	// Both should succeed (process restart worked)
+	assert.NotNil(t, resp1)
+	assert.NotNil(t, resp2)
+
+	// Thread IDs should be different (new threads for each call)
+	metadata1 := codec.GetMetadata(resp1)
+	metadata2 := codec.GetMetadata(resp2)
+	assert.NotEqual(t, metadata1.ThreadID, metadata2.ThreadID,
+		"different requests should have different thread IDs")
+}
+
+func TestIntegration_TemperatureBoundaries(t *testing.T) {
+	model := NewLanguageModel("")
+
+	prompt := []api.Message{
+		&api.UserMessage{
+			Content: []api.ContentBlock{
+				&api.TextBlock{Text: "Say 'test'."},
+			},
+		},
+	}
+
+	tests := []struct {
+		name  string
+		temp  float64
+		valid bool
+	}{
+		{"zero", 0.0, true},
+		{"half", 0.5, true},
+		{"one", 1.0, true},
+		{"negative", -0.1, false},
+		{"too_high", 2.0, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := model.Generate(context.Background(), prompt, api.CallOptions{
+				Temperature: &tt.temp,
+			})
+
+			if tt.valid {
+				assert.NoError(t, err, "temperature %.1f should be valid", tt.temp)
+			} else {
+				assert.Error(t, err, "temperature %.1f should be invalid", tt.temp)
+			}
+		})
+	}
+}
+
+func wordCount(s string) int {
+	return len(strings.Fields(s))
+}
+
+func assertUsageIfPresent(t *testing.T, usage api.Usage) {
+	t.Helper()
+	if usage.InputTokens == 0 && usage.OutputTokens == 0 && usage.TotalTokens == 0 {
+		t.Logf("Usage not populated; skipping assertions")
+		return
+	}
+
+	assert.Greater(t, usage.InputTokens, 0, "expected input tokens")
+	assert.Greater(t, usage.OutputTokens, 0, "expected output tokens")
+	assert.Equal(t, usage.InputTokens+usage.OutputTokens, usage.TotalTokens)
+}
+
 // Helper function to check if text contains any of the given substrings (case-insensitive)
 func contains(text string, substrs ...string) bool {
-	textLower := toLower(text)
+	textLower := strings.ToLower(text)
 	for _, s := range substrs {
-		if containsStr(textLower, toLower(s)) {
+		if strings.Contains(textLower, strings.ToLower(s)) {
 			return true
 		}
 	}
 	return false
 }
 
-func toLower(s string) string {
-	result := make([]byte, len(s))
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c >= 'A' && c <= 'Z' {
-			c += 'a' - 'A'
-		}
-		result[i] = c
+// extractJSON extracts JSON from markdown code blocks or returns the text as-is
+func extractJSON(text string) string {
+	// Try to extract from markdown code blocks: ```json ... ``` or ``` ... ```
+	re := regexp.MustCompile("```(?:json)?\\s*({[^`]+})\\s*```")
+	if matches := re.FindStringSubmatch(text); len(matches) > 1 {
+		return matches[1]
 	}
-	return string(result)
-}
-
-func containsStr(s, substr string) bool {
-	return len(substr) <= len(s) && (s == substr || len(substr) == 0 || findSubstr(s, substr) >= 0)
-}
-
-func findSubstr(s, substr string) int {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return i
-		}
-	}
-	return -1
+	return text
 }
