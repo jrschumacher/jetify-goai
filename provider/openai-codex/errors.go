@@ -25,12 +25,10 @@ const (
 	CategoryAuthenticationFailed = cli.CategoryAuthenticationFailed
 	CategoryInvalidRequest       = cli.CategoryInvalidRequest
 	CategoryProcessFailure       = cli.CategoryProcessFailure
+	CategoryModelNotAvailable    = cli.CategoryModelNotAvailable
+	CategoryContextCanceled      = cli.CategoryContextCanceled
 	CategoryUnknown              = cli.CategoryUnknown
 )
-
-// CategoryModelNotAvailable indicates requested model is unavailable.
-// This is a Codex-specific category not in the shared package.
-const CategoryModelNotAvailable ErrorCategory = "model_not_available"
 
 // CodexClassifier extends BaseClassifier with JSON-RPC specific error handling.
 type CodexClassifier struct {

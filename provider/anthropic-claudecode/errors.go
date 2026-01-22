@@ -1,6 +1,7 @@
 package claudecode
 
 import (
+	"errors"
 	"strings"
 	"time"
 
@@ -20,7 +21,9 @@ const (
 	CategoryServiceUnavailable   = cli.CategoryServiceUnavailable
 	CategoryAuthenticationFailed = cli.CategoryAuthenticationFailed
 	CategoryInvalidRequest       = cli.CategoryInvalidRequest
+	CategoryModelNotAvailable    = cli.CategoryModelNotAvailable
 	CategoryProcessFailure       = cli.CategoryProcessFailure
+	CategoryContextCanceled      = cli.CategoryContextCanceled
 	CategoryUnknown              = cli.CategoryUnknown
 )
 
@@ -43,8 +46,9 @@ func (c *ClaudeCodeClassifier) Classify(err error) *cli.ErrorInfo {
 		return nil
 	}
 
-	// Check if it's already an ErrorInfo
-	if errInfo, ok := err.(*cli.ErrorInfo); ok {
+	// Check if it's already an ErrorInfo (use errors.As for wrapped errors)
+	var errInfo *cli.ErrorInfo
+	if errors.As(err, &errInfo) {
 		return errInfo
 	}
 

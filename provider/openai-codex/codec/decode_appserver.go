@@ -11,13 +11,14 @@ import (
 
 // App-server notification method constants.
 const (
-	NotifyItemAgentMessageDelta  = "item/agentMessage/delta"
-	NotifyItemReasoningDelta     = "item/reasoning/summaryTextDelta"
-	NotifyItemStarted            = "item/started"
-	NotifyItemCompleted          = "item/completed"
-	NotifyTurnStarted            = "turn/started"
-	NotifyTurnCompleted          = "turn/completed"
-	NotifyThreadStarted          = "thread/started"
+	NotifyItemAgentMessageDelta           = "item/agentMessage/delta"
+	NotifyItemReasoningDelta              = "item/reasoning/summaryTextDelta"
+	NotifyItemCommandExecutionOutputDelta = "item/commandExecution/outputDelta"
+	NotifyItemStarted                     = "item/started"
+	NotifyItemCompleted                   = "item/completed"
+	NotifyTurnStarted                     = "turn/started"
+	NotifyTurnCompleted                   = "turn/completed"
+	NotifyThreadStarted                   = "thread/started"
 )
 
 // TextDeltaParams contains parameters for item/agentMessage/delta notifications.
@@ -57,8 +58,8 @@ type TurnStartedParams struct {
 
 // TurnCompletedParams contains parameters for turn/completed notifications.
 type TurnCompletedParams struct {
-	Turn  *AppServerTurn   `json:"turn,omitempty"`
-	Usage *AppServerUsage  `json:"usage,omitempty"`
+	Turn  *AppServerTurn  `json:"turn,omitempty"`
+	Usage *AppServerUsage `json:"usage,omitempty"`
 }
 
 // AppServerTurn represents a turn in app-server notifications.

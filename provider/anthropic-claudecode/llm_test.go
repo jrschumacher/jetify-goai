@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.jetify.com/ai/api"
 	"go.jetify.com/ai/provider/anthropic-claudecode/process"
+	"go.jetify.com/ai/provider/internal/cli"
 )
 
 func TestLanguageModel_ProviderName(t *testing.T) {
@@ -135,6 +136,33 @@ func TestLanguageModel_Generate_Usage(t *testing.T) {
 	assert.Equal(t, 50, resp.Usage.OutputTokens)
 	assert.Equal(t, 150, resp.Usage.TotalTokens)
 	assert.Equal(t, 25, resp.Usage.CachedInputTokens)
+}
+
+func TestLanguageModel_TokenUsageTracker(t *testing.T) {
+	mockProc := process.NewMockProcess()
+
+	mockProc.WriteStdout([]byte(`{"type":"system","subtype":"init","session_id":"abc-123"}` + "\n"))
+	mockProc.WriteStdout([]byte(`{"type":"result","subtype":"success","session_id":"abc-123","message":{"content":[{"type":"text","text":"Hi"}],"stop_reason":"end_turn"},"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":2}}` + "\n"))
+
+	tracker := cli.NewTokenTracker()
+	model := NewLanguageModel("sonnet", WithProcess(mockProc), WithTokenTracker(tracker))
+
+	prompt := []api.Message{
+		&api.UserMessage{Content: []api.ContentBlock{&api.TextBlock{Text: "Hi"}}},
+	}
+
+	_, err := model.Generate(context.Background(), prompt, api.CallOptions{})
+	require.NoError(t, err)
+
+	u := model.TokenUsage()
+	assert.Equal(t, 10, u.InputTokens)
+	assert.Equal(t, 5, u.OutputTokens)
+	assert.Equal(t, 15, u.TotalTokens)
+	assert.Equal(t, 2, u.CachedTokens)
+
+	model.ResetTokenUsage()
+	u = model.TokenUsage()
+	assert.Equal(t, 0, u.TotalTokens)
 }
 
 func TestLanguageModel_Generate_ResponseInfo(t *testing.T) {

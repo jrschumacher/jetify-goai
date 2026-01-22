@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 
 	"go.jetify.com/ai/provider/openai-codex/codec/jsonrpc"
@@ -130,9 +131,37 @@ func (p *AppServerProcess) StartThread(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("process not running")
 	}
 	client := p.client
+	cfg := *p.config
 	p.mu.Unlock()
 
-	params := jsonrpc.ThreadStartParams{}
+	params := jsonrpc.ThreadStartParams{
+		Model:                 cfg.Model,
+		BaseInstructions:      cfg.SystemPrompt,
+		DeveloperInstructions: "",
+		Cwd:                   cfg.WorkDir,
+	}
+
+	if mode, ok := sandboxModeFromString(cfg.SandboxMode); ok {
+		params.Sandbox = mode
+	}
+
+	// Best-effort config overrides (matches ~/.codex/config.toml layout).
+	if len(cfg.MCPServers) > 0 {
+		servers := make(map[string]any, len(cfg.MCPServers))
+		for name, server := range cfg.MCPServers {
+			serverCfg := map[string]any{
+				"command": server.Command,
+				"args":    server.Args,
+			}
+			if len(server.Env) > 0 {
+				serverCfg["env"] = server.Env
+			}
+			servers[name] = serverCfg
+		}
+		params.Config = map[string]any{
+			"mcp_servers": servers,
+		}
+	}
 
 	result, err := client.Call(ctx, "thread/start", params)
 	if err != nil {
@@ -160,12 +189,16 @@ func (p *AppServerProcess) StartTurn(ctx context.Context, threadID string, input
 		return fmt.Errorf("process not running")
 	}
 	client := p.client
+	cfg := *p.config
 	p.mu.Unlock()
 
 	params := jsonrpc.TurnStartParams{
 		ThreadID:       threadID,
 		Input:          input,
 		ApprovalPolicy: policy,
+		Model:          cfg.Model,
+		Cwd:            cfg.WorkDir,
+		SandboxPolicy:  sandboxPolicyFromConfig(cfg),
 	}
 
 	_, err := client.Call(ctx, "turn/start", params)
@@ -277,4 +310,50 @@ func (p *AppServerProcess) Client() *jsonrpc.Client {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.client
+}
+
+func sandboxModeFromString(mode string) (jsonrpc.SandboxMode, bool) {
+	if mode == "" {
+		return "", false
+	}
+
+	normalized := strings.TrimSpace(mode)
+	normalized = strings.ToLower(normalized)
+	normalized = strings.ReplaceAll(normalized, "_", "-")
+
+	switch normalized {
+	case "read-only", "readonly", "readonly-mode":
+		return jsonrpc.SandboxReadOnly, true
+	case "workspace-write", "workspacewrite", "workspace":
+		return jsonrpc.SandboxWorkspaceWrite, true
+	case "danger-full-access", "dangerfullaccess", "danger":
+		return jsonrpc.SandboxDangerFullAccess, true
+	case "no-access":
+		// Legacy value - treat as read-only.
+		return jsonrpc.SandboxReadOnly, true
+	default:
+		return "", false
+	}
+}
+
+func sandboxPolicyFromConfig(cfg Config) *jsonrpc.SandboxPolicy {
+	mode, ok := sandboxModeFromString(cfg.SandboxMode)
+	if !ok {
+		return nil
+	}
+
+	switch mode {
+	case jsonrpc.SandboxReadOnly:
+		return &jsonrpc.SandboxPolicy{Type: string(jsonrpc.SandboxReadOnly)}
+	case jsonrpc.SandboxDangerFullAccess:
+		return &jsonrpc.SandboxPolicy{Type: string(jsonrpc.SandboxDangerFullAccess)}
+	case jsonrpc.SandboxWorkspaceWrite:
+		policy := &jsonrpc.SandboxPolicy{Type: string(jsonrpc.SandboxWorkspaceWrite)}
+		if cfg.NetworkAccess {
+			policy.NetworkAccess = true
+		}
+		return policy
+	default:
+		return nil
+	}
 }

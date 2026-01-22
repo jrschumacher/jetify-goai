@@ -11,10 +11,10 @@ const Version = "2.0"
 
 // Request represents a JSON-RPC 2.0 request.
 type Request struct {
-	JSONRPC string      `json:"jsonrpc"`
-	Method  string      `json:"method"`
-	Params  any `json:"params,omitempty"`
-	ID      int64       `json:"id"`
+	JSONRPC string `json:"jsonrpc"`
+	Method  string `json:"method"`
+	Params  any    `json:"params,omitempty"`
+	ID      int64  `json:"id"`
 }
 
 // NewRequest creates a new JSON-RPC request.
@@ -129,15 +129,63 @@ type InitializeResult struct {
 	UserAgent string `json:"userAgent,omitempty"`
 }
 
+// SandboxMode controls which sandbox mode to use when executing model-generated shell commands.
+type SandboxMode string
+
+const (
+	SandboxReadOnly         SandboxMode = "readOnly"
+	SandboxWorkspaceWrite   SandboxMode = "workspaceWrite"
+	SandboxDangerFullAccess SandboxMode = "dangerFullAccess"
+)
+
+// SandboxPolicy controls sandbox policy details (e.g. network access, writable roots).
+//
+// The exact fields that apply depend on the Type.
+type SandboxPolicy struct {
+	Type string `json:"type"` // "readOnly" | "workspaceWrite" | "dangerFullAccess"
+
+	// WorkspaceWriteSandboxPolicy fields
+	WritableRoots       []string `json:"writableRoots,omitempty"`
+	NetworkAccess       bool     `json:"networkAccess,omitempty"`
+	ExcludeSlashTmp     bool     `json:"excludeSlashTmp,omitempty"`
+	ExcludeTmpdirEnvVar bool     `json:"excludeTmpdirEnvVar,omitempty"`
+}
+
 // ThreadStartParams contains parameters for thread/start request.
 type ThreadStartParams struct {
-	// Currently empty, but may have options in the future.
+	// Model is the model identifier to use for this thread.
+	Model string `json:"model,omitempty"`
+
+	// BaseInstructions sets the base instructions for the thread (similar to a system prompt).
+	BaseInstructions string `json:"baseInstructions,omitempty"`
+
+	// DeveloperInstructions sets developer instructions for the thread (optional).
+	DeveloperInstructions string `json:"developerInstructions,omitempty"`
+
+	// Cwd sets the working directory for the thread.
+	Cwd string `json:"cwd,omitempty"`
+
+	// Sandbox sets the sandbox mode for the thread.
+	Sandbox SandboxMode `json:"sandbox,omitempty"`
+
+	// ApprovalPolicy sets the approval policy for the thread.
+	ApprovalPolicy ApprovalPolicy `json:"approvalPolicy,omitempty"`
+
+	// Config allows passing arbitrary Codex configuration overrides.
+	// This maps to Codex CLI config keys (e.g. config.toml) and is intentionally untyped.
+	Config map[string]any `json:"config,omitempty"`
 }
 
 // ThreadStartResult contains the result of thread/start.
 type ThreadStartResult struct {
 	Thread Thread `json:"thread"`
-	Model  string `json:"model,omitempty"`
+
+	// Thread configuration as resolved by the server.
+	Model          string         `json:"model,omitempty"`
+	ModelProvider  string         `json:"modelProvider,omitempty"`
+	Cwd            string         `json:"cwd,omitempty"`
+	Sandbox        *SandboxPolicy `json:"sandbox,omitempty"`
+	ApprovalPolicy ApprovalPolicy `json:"approvalPolicy,omitempty"`
 }
 
 // Thread represents a conversation thread.
@@ -150,12 +198,27 @@ type TurnStartParams struct {
 	ThreadID       string         `json:"threadId"`
 	Input          []Input        `json:"input"`
 	ApprovalPolicy ApprovalPolicy `json:"approvalPolicy,omitempty"`
+
+	// Optional per-turn overrides.
+	Model         string         `json:"model,omitempty"`
+	Cwd           string         `json:"cwd,omitempty"`
+	SandboxPolicy *SandboxPolicy `json:"sandboxPolicy,omitempty"`
 }
 
-// Input represents an input message for a turn.
+// Input represents a user input item for a turn.
+//
+// Codex app-server supports multiple input types (text, image url, local image).
 type Input struct {
 	Type string `json:"type"`
+
+	// Text input
 	Text string `json:"text,omitempty"`
+
+	// Remote image input
+	URL string `json:"url,omitempty"`
+
+	// Local image input
+	Path string `json:"path,omitempty"`
 }
 
 // ApprovalPolicy controls how tool executions are approved.
@@ -164,10 +227,18 @@ type ApprovalPolicy string
 const (
 	// ApprovalNever means tools execute without approval.
 	ApprovalNever ApprovalPolicy = "never"
-	// ApprovalAlways means tools always require approval.
-	ApprovalAlways ApprovalPolicy = "always"
-	// ApprovalOnce means approval is requested once per tool type.
-	ApprovalOnce ApprovalPolicy = "once"
+
+	// ApprovalUnlessTrusted means approvals are required unless the current directory is trusted.
+	ApprovalUnlessTrusted ApprovalPolicy = "unlessTrusted"
+	// ApprovalOnFailure means approvals are requested when something fails.
+	ApprovalOnFailure ApprovalPolicy = "onFailure"
+	// ApprovalOnRequest means approvals are requested when a tool asks for it.
+	ApprovalOnRequest ApprovalPolicy = "onRequest"
+
+	// Deprecated: legacy constants from older protocol versions. Prefer ApprovalOnRequest.
+	ApprovalAlways ApprovalPolicy = ApprovalOnRequest
+	// Deprecated: legacy constants from older protocol versions. Prefer ApprovalOnRequest.
+	ApprovalOnce ApprovalPolicy = ApprovalOnRequest
 )
 
 // TurnStartResult contains the result of turn/start.

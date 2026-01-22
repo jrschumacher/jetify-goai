@@ -59,6 +59,8 @@ type LanguageModel struct {
 var (
 	_ api.LanguageModel    = &LanguageModel{}
 	_ api.CLILanguageModel = &LanguageModel{}
+	_ api.CLITokenTracker  = &LanguageModel{}
+	_ api.CLIConfigAware   = &LanguageModel{}
 )
 
 // NewLanguageModel creates a new Claude Code language model.
@@ -227,6 +229,10 @@ func (m *LanguageModel) Generate(
 				m.tokenTracker.Add(resp.Usage)
 			}
 
+			if resp != nil {
+				resp.Warnings = append(resp.Warnings, callOptionWarnings(opts)...)
+			}
+
 			return resp, nil
 		}
 
@@ -299,6 +305,46 @@ func (m *LanguageModel) RestartProcess(ctx context.Context) error {
 		m.proc = nil
 	}
 	return nil
+}
+
+// TokenUsage returns cumulative token usage for this model instance.
+func (m *LanguageModel) TokenUsage() api.CLITokenUsage {
+	if m.tokenTracker == nil {
+		return api.CLITokenUsage{}
+	}
+	u := m.tokenTracker.Usage()
+	return api.CLITokenUsage{
+		InputTokens:  u.InputTokens,
+		OutputTokens: u.OutputTokens,
+		TotalTokens:  u.TotalTokens,
+		CachedTokens: u.CachedTokens,
+	}
+}
+
+// ResetTokenUsage clears the cumulative token counters for this model instance.
+func (m *LanguageModel) ResetTokenUsage() {
+	if m.tokenTracker != nil {
+		m.tokenTracker.Reset()
+	}
+}
+
+// ConfigNeedsRestart returns true if the given call options would require restarting the underlying process.
+// Currently, only temperature changes require a restart.
+func (m *LanguageModel) ConfigNeedsRestart(opts api.CallOptions) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.proc == nil || !m.proc.IsRunning() {
+		return false
+	}
+
+	var temp float64
+	hasTemp := opts.Temperature != nil
+	if hasTemp {
+		temp = *opts.Temperature
+	}
+
+	return m.cachedKey.Temperature != temp || m.cachedKey.HasTemp != hasTemp
 }
 
 // Close stops the underlying process.

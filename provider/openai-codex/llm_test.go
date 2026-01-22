@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.jetify.com/ai/api"
+	"go.jetify.com/ai/provider/internal/cli"
 	"go.jetify.com/ai/provider/openai-codex/codec"
 	"go.jetify.com/ai/provider/openai-codex/process"
 )
@@ -235,6 +236,115 @@ func TestLanguageModel_Generate_ResponseInfo(t *testing.T) {
 
 	require.NotNil(t, resp.ResponseInfo)
 	assert.Equal(t, "thread-info", resp.ResponseInfo.ID)
+}
+
+func TestLanguageModel_Generate_ProviderMetadataAlwaysPresent(t *testing.T) {
+	mockProc := process.NewMockAppServer()
+
+	mockProc.OnStartThread = func(ctx context.Context) (string, error) {
+		go func() {
+			mockProc.SendNotification(codec.NotifyItemAgentMessageDelta, codec.TextDeltaParams{
+				ItemID: "item_1",
+				Delta:  "Hello",
+			})
+			mockProc.SendNotification(codec.NotifyTurnCompleted, codec.TurnCompletedParams{
+				Usage: &codec.AppServerUsage{
+					InputTokens:  10,
+					OutputTokens: 5,
+				},
+			})
+		}()
+		return "thread-meta-always", nil
+	}
+
+	model := NewLanguageModel("o3", WithAppServer(mockProc))
+
+	prompt := []api.Message{
+		&api.UserMessage{Content: []api.ContentBlock{&api.TextBlock{Text: "Hi"}}},
+	}
+
+	resp, err := model.Generate(context.Background(), prompt, api.CallOptions{})
+	require.NoError(t, err)
+	require.NotNil(t, resp.ProviderMetadata)
+
+	metadata := codec.GetMetadata(resp)
+	require.NotNil(t, metadata)
+	assert.Equal(t, "thread-meta-always", metadata.ThreadID)
+}
+
+func TestLanguageModel_Generate_CapturesCommandExecutionsAndFileChanges(t *testing.T) {
+	mockProc := process.NewMockAppServer()
+
+	mockProc.OnStartThread = func(ctx context.Context) (string, error) {
+		go func() {
+			// Command execution output deltas.
+			mockProc.SendNotification(codec.NotifyItemCommandExecutionOutputDelta, map[string]any{
+				"itemId": "cmd_1",
+				"delta":  "hello",
+			})
+			mockProc.SendNotification(codec.NotifyItemCommandExecutionOutputDelta, map[string]any{
+				"itemId": "cmd_1",
+				"delta":  " world",
+			})
+
+			// Command execution completion.
+			mockProc.SendNotification(codec.NotifyItemCompleted, map[string]any{
+				"item": map[string]any{
+					"id":       "cmd_1",
+					"type":     "commandExecution",
+					"command":  "echo hello",
+					"exitCode": 0,
+				},
+			})
+
+			// File change completion.
+			mockProc.SendNotification(codec.NotifyItemCompleted, map[string]any{
+				"item": map[string]any{
+					"id":   "file_1",
+					"type": "fileChange",
+					"changes": []any{
+						map[string]any{
+							"path": "test.go",
+							"diff": "+ new line",
+						},
+					},
+				},
+			})
+
+			mockProc.SendNotification(codec.NotifyItemAgentMessageDelta, codec.TextDeltaParams{
+				ItemID: "item_1",
+				Delta:  "Done",
+			})
+			mockProc.SendNotification(codec.NotifyTurnCompleted, codec.TurnCompletedParams{
+				Usage: &codec.AppServerUsage{
+					InputTokens:  10,
+					OutputTokens: 5,
+				},
+			})
+		}()
+		return "thread-meta-items", nil
+	}
+
+	model := NewLanguageModel("o3", WithAppServer(mockProc))
+
+	prompt := []api.Message{
+		&api.UserMessage{Content: []api.ContentBlock{&api.TextBlock{Text: "Hi"}}},
+	}
+
+	resp, err := model.Generate(context.Background(), prompt, api.CallOptions{})
+	require.NoError(t, err)
+
+	metadata := codec.GetMetadata(resp)
+	require.NotNil(t, metadata)
+
+	require.Len(t, metadata.CommandExecutions, 1)
+	assert.Equal(t, "echo hello", metadata.CommandExecutions[0].Command)
+	assert.Equal(t, 0, metadata.CommandExecutions[0].ExitCode)
+	assert.Equal(t, "hello world", metadata.CommandExecutions[0].Output)
+
+	require.Len(t, metadata.FileChanges, 1)
+	assert.Equal(t, "test.go", metadata.FileChanges[0].FilePath)
+	assert.Equal(t, "+ new line", metadata.FileChanges[0].Diff)
 }
 
 func TestLanguageModel_Generate_MultipleDeltas(t *testing.T) {
@@ -626,7 +736,7 @@ func TestLanguageModel_ProcessReuse(t *testing.T) {
 
 	model := NewLanguageModel("o3", WithAppServer(mockProc))
 	// Set cached key to match the config
-	model.cachedKey = process.ConfigKey{Model: "o3"}
+	model.cachedKey = cli.ConfigKey{Model: "o3"}
 
 	prompt := []api.Message{
 		&api.UserMessage{Content: []api.ContentBlock{&api.TextBlock{Text: "Hi"}}},

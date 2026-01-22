@@ -4,7 +4,10 @@ package process
 import (
 	"context"
 	"io"
+	"sort"
+	"strings"
 
+	"go.jetify.com/ai/provider/internal/cli"
 	"go.jetify.com/ai/provider/openai-codex/codec/jsonrpc"
 )
 
@@ -79,7 +82,9 @@ type Config struct {
 	Temperature *float64
 
 	// SandboxMode controls the execution sandbox mode.
-	// Valid values: "workspace-write", "read-only", "no-access"
+	// Valid values: "workspace-write", "read-only", "danger-full-access"
+	//
+	// The value is mapped to the Codex app-server protocol's SandboxMode enum.
 	SandboxMode string
 
 	// SkipGitRepoCheck allows working in non-git directories.
@@ -134,7 +139,7 @@ func WithTemperature(temp float64) Option {
 }
 
 // WithSandboxMode sets the execution sandbox mode.
-// Valid values: "workspace-write", "read-only", "no-access"
+// Valid values: "workspace-write", "read-only", "danger-full-access"
 func WithSandboxMode(mode string) Option {
 	return func(c *Config) {
 		c.SandboxMode = mode
@@ -200,44 +205,45 @@ func NewConfig(opts ...Option) *Config {
 
 // ConfigKey returns a comparable key for the config.
 // Used to detect when config changes require process restart.
-func (c *Config) ConfigKey() ConfigKey {
+func (c *Config) ConfigKey() cli.ConfigKey {
 	var temp float64
 	if c.Temperature != nil {
 		temp = *c.Temperature
 	}
 
-	// Serialize MCP servers for comparison
-	mcpKey := ""
+	extra := make(map[string]string)
+	if c.WorkDir != "" {
+		extra["workdir"] = c.WorkDir
+	}
+	if c.SandboxMode != "" {
+		extra["sandbox_mode"] = c.SandboxMode
+	}
+	if c.SkipGitRepoCheck {
+		extra["skip_git_repo_check"] = "true"
+	}
+	if c.NetworkAccess {
+		extra["network_access"] = "true"
+	}
+	if c.WebSearch {
+		extra["web_search"] = "true"
+	}
 	if len(c.MCPServers) > 0 {
-		// Simple serialization - just concatenate names
-		// In practice, full comparison would serialize the entire config
+		names := make([]string, 0, len(c.MCPServers))
 		for name := range c.MCPServers {
-			mcpKey += name + ","
+			names = append(names, name)
 		}
+		sort.Strings(names)
+		extra["mcp_servers"] = strings.Join(names, ",")
 	}
 
-	return ConfigKey{
-		Model:            c.Model,
-		SystemPrompt:     c.SystemPrompt,
-		Temperature:      temp,
-		HasTemp:          c.Temperature != nil,
-		SandboxMode:      c.SandboxMode,
-		SkipGitRepoCheck: c.SkipGitRepoCheck,
-		NetworkAccess:    c.NetworkAccess,
-		WebSearch:        c.WebSearch,
-		MCPServersKey:    mcpKey,
+	return cli.ConfigKey{
+		Model:        c.Model,
+		SystemPrompt: c.SystemPrompt,
+		Temperature:  temp,
+		HasTemp:      c.Temperature != nil,
+		Extra:        extra,
 	}
 }
 
-// ConfigKey is a comparable struct for detecting config changes.
-type ConfigKey struct {
-	Model            string
-	SystemPrompt     string
-	Temperature      float64
-	HasTemp          bool
-	SandboxMode      string
-	SkipGitRepoCheck bool
-	NetworkAccess    bool
-	WebSearch        bool
-	MCPServersKey    string
-}
+// Ensure Config implements cli.ConfigComparable.
+var _ cli.ConfigComparable = (*Config)(nil)
