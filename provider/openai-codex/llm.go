@@ -58,7 +58,10 @@ type LanguageModel struct {
 	retryPolicy *RetryPolicy
 }
 
-var _ api.LanguageModel = &LanguageModel{}
+var (
+	_ api.LanguageModel    = &LanguageModel{}
+	_ api.CLILanguageModel = &LanguageModel{}
+)
 
 // NewLanguageModel creates a new Codex CLI language model.
 func NewLanguageModel(modelID string, opts ...ModelOption) *LanguageModel {
@@ -413,6 +416,28 @@ func (d *streamDecoder) decodeEvents() iter.Seq[api.StreamEvent] {
 			}
 		}
 	}
+}
+
+// IsProcessRunning returns true if the underlying CLI process is running.
+func (m *LanguageModel) IsProcessRunning() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.proc != nil && m.proc.IsRunning()
+}
+
+// RestartProcess stops the current process and starts a new one.
+// The new process will be started on the next Generate or Stream call.
+func (m *LanguageModel) RestartProcess(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.proc != nil {
+		if err := m.proc.Stop(); err != nil {
+			return err
+		}
+		m.proc = nil
+	}
+	return nil
 }
 
 // Close stops the underlying process.
