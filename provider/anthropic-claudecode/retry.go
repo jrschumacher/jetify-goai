@@ -1,4 +1,4 @@
-package codex
+package claudecode
 
 import (
 	"go.jetify.com/ai/provider/internal/cli"
@@ -21,7 +21,7 @@ var (
 )
 
 // NewRetryPolicy creates a new retry policy with sensible defaults
-// and automatically configures it with the Codex error classifier.
+// and automatically configures it with the Claude Code error classifier.
 func NewRetryPolicy(opts ...RetryPolicyOption) *RetryPolicy {
 	// Start with the shared retry policy
 	allOpts := []cli.RetryPolicyOption{
@@ -32,5 +32,5 @@ func NewRetryPolicy(opts ...RetryPolicyOption) *RetryPolicy {
 }
 
 // DefaultRetryPolicy returns a retry policy with default settings
-// configured with the Codex error classifier.
+// configured with the Claude Code error classifier.
 var DefaultRetryPolicy = NewRetryPolicy()

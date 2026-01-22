@@ -4,6 +4,8 @@ package process
 import (
 	"context"
 	"io"
+
+	"go.jetify.com/ai/provider/internal/cli"
 )
 
 // Process represents a Claude CLI process.
@@ -138,3 +140,34 @@ func NewConfig(opts ...Option) *Config {
 	}
 	return cfg
 }
+
+// ConfigKey returns a comparable key for detecting config changes.
+// Implements cli.ConfigComparable interface.
+func (c *Config) ConfigKey() cli.ConfigKey {
+	var temp float64
+	if c.Temperature != nil {
+		temp = *c.Temperature
+	}
+
+	extra := make(map[string]string)
+	if c.WorkDir != "" {
+		extra["workdir"] = c.WorkDir
+	}
+	if c.JSONSchema != "" {
+		extra["jsonschema"] = c.JSONSchema
+	}
+	if c.ResumeSessionID != "" {
+		extra["resume"] = c.ResumeSessionID
+	}
+
+	return cli.ConfigKey{
+		Model:        c.Model,
+		SystemPrompt: c.SystemPrompt,
+		Temperature:  temp,
+		HasTemp:      c.Temperature != nil,
+		Extra:        extra,
+	}
+}
+
+// Ensure Config implements cli.ConfigComparable
+var _ cli.ConfigComparable = (*Config)(nil)

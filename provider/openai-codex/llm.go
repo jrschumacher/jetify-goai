@@ -2,11 +2,13 @@ package codex
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"iter"
 	"sync"
 
 	"go.jetify.com/ai/api"
+	"go.jetify.com/ai/provider/internal/cli"
 	"go.jetify.com/ai/provider/openai-codex/codec"
 	"go.jetify.com/ai/provider/openai-codex/codec/jsonrpc"
 	"go.jetify.com/ai/provider/openai-codex/process"
@@ -32,6 +34,13 @@ func WithCostMonitor(monitor *CostMonitor) ModelOption {
 	}
 }
 
+// WithTokenTracker sets a token tracker for monitoring token usage.
+func WithTokenTracker(tracker *cli.TokenTracker) ModelOption {
+	return func(m *LanguageModel) {
+		m.tokenTracker = tracker
+	}
+}
+
 // WithRetryPolicy sets a custom retry policy for handling transient failures.
 func WithRetryPolicy(policy *RetryPolicy) ModelOption {
 	return func(m *LanguageModel) {
@@ -44,21 +53,34 @@ func WithRetryPolicy(policy *RetryPolicy) ModelOption {
 type LanguageModel struct {
 	mu sync.Mutex
 
+	// callMu serializes calls that consume the shared app-server notification stream.
+	// The Codex CLI protocol does not provide sufficient correlation fields to safely
+	// demultiplex concurrent turns, so a single LanguageModel instance is single-flight.
+	callMu sync.Mutex
+
 	modelID string
 	proc    process.AppServer
 
 	// cachedKey tracks the config used to start the current process.
 	// If options change, the process is restarted.
-	cachedKey process.ConfigKey
+	cachedKey cli.ConfigKey
 
 	// costMonitor tracks token usage and enforces budget limits.
 	costMonitor *CostMonitor
+
+	// tokenTracker tracks token usage across the session.
+	tokenTracker *cli.TokenTracker
 
 	// retryPolicy defines how operations should be retried on failure.
 	retryPolicy *RetryPolicy
 }
 
-var _ api.LanguageModel = &LanguageModel{}
+var (
+	_ api.LanguageModel    = &LanguageModel{}
+	_ api.CLILanguageModel = &LanguageModel{}
+	_ api.CLITokenTracker  = &LanguageModel{}
+	_ api.CLIConfigAware   = &LanguageModel{}
+)
 
 // NewLanguageModel creates a new Codex CLI language model.
 func NewLanguageModel(modelID string, opts ...ModelOption) *LanguageModel {
@@ -95,9 +117,6 @@ func (m *LanguageModel) buildConfig(systemPrompt string, opts api.CallOptions) *
 		Model:        m.modelID,
 		SystemPrompt: systemPrompt,
 	}
-	if opts.Temperature != nil {
-		cfg.Temperature = opts.Temperature
-	}
 	return cfg
 }
 
@@ -111,7 +130,7 @@ func (m *LanguageModel) ensureProcess(ctx context.Context, cfg *process.Config) 
 
 	// Check if we need to restart due to config change
 	if m.proc != nil && m.proc.IsRunning() {
-		if m.cachedKey == newKey {
+		if cli.ConfigKeysEqual(m.cachedKey, newKey) {
 			return nil // Config unchanged, reuse existing process
 		}
 		// Config changed, stop the old process
@@ -170,6 +189,9 @@ func (m *LanguageModel) ensureProcess(ctx context.Context, cfg *process.Config) 
 func (m *LanguageModel) Generate(
 	ctx context.Context, prompt []api.Message, opts api.CallOptions,
 ) (*api.Response, error) {
+	m.callMu.Lock()
+	defer m.callMu.Unlock()
+
 	// Extract system prompt and build user prompt
 	systemPrompt, userPrompt := codec.BuildPromptWithSystemSeparate(prompt)
 
@@ -204,6 +226,9 @@ func (m *LanguageModel) Generate(
 	var textBlock *api.TextBlock
 	var usage api.Usage
 	var reasoning string
+	var commandExecutions []codec.CommandExecution
+	var fileChanges []codec.FileChange
+	commandOutputByItemID := make(map[string]string)
 
 	notifications := proc.Notifications()
 	for {
@@ -216,6 +241,8 @@ func (m *LanguageModel) Generate(
 				// Channel closed unexpectedly
 				return nil, fmt.Errorf("notification channel closed unexpectedly")
 			}
+
+			observeNotification(notif, commandOutputByItemID, &commandExecutions, &fileChanges)
 
 			event, err := codec.DecodeNotification(notif)
 			if err != nil {
@@ -250,7 +277,18 @@ func (m *LanguageModel) Generate(
 					}
 				}
 
+				// Track token usage if tracker is configured
+				if m.tokenTracker != nil {
+					m.tokenTracker.Add(usage)
+				}
+
 				// Build and return the response
+				metadata := &codec.Metadata{
+					ThreadID:          threadID,
+					Reasoning:         reasoning,
+					CommandExecutions: commandExecutions,
+					FileChanges:       fileChanges,
+				}
 				resp := &api.Response{
 					Content:      content,
 					FinishReason: e.FinishReason,
@@ -258,18 +296,11 @@ func (m *LanguageModel) Generate(
 					ResponseInfo: &api.ResponseInfo{
 						ID: threadID,
 					},
-				}
-
-				// Add reasoning to provider metadata if present
-				if reasoning != "" {
-					metadata := &codec.Metadata{
-						ThreadID:  threadID,
-						Reasoning: reasoning,
-					}
-					resp.ProviderMetadata = api.NewProviderMetadata(map[string]any{
+					ProviderMetadata: api.NewProviderMetadata(map[string]any{
 						codec.ProviderName: metadata,
-					})
+					}),
 				}
+				resp.Warnings = append(resp.Warnings, callOptionWarnings(opts)...)
 
 				return resp, nil
 
@@ -318,10 +349,11 @@ func (m *LanguageModel) Stream(
 
 	// Create the stream decoder
 	decoder := &streamDecoder{
-		ctx:         ctx,
-		proc:        proc,
-		threadID:    threadID,
-		costMonitor: m.costMonitor,
+		ctx:          ctx,
+		proc:         proc,
+		threadID:     threadID,
+		costMonitor:  m.costMonitor,
+		tokenTracker: m.tokenTracker,
 	}
 
 	return &api.StreamResponse{
@@ -336,6 +368,11 @@ type streamDecoder struct {
 	threadID     string
 	reasoning    string
 	costMonitor  *CostMonitor
+	tokenTracker *cli.TokenTracker
+
+	commandExecutions     []codec.CommandExecution
+	fileChanges           []codec.FileChange
+	commandOutputByItemID map[string]string
 }
 
 // decodeEvents returns an iterator that yields events from the notification stream.
@@ -347,6 +384,9 @@ func (d *streamDecoder) decodeEvents() iter.Seq[api.StreamEvent] {
 		}
 
 		notifications := d.proc.Notifications()
+		if d.commandOutputByItemID == nil {
+			d.commandOutputByItemID = make(map[string]string)
+		}
 
 		for {
 			select {
@@ -360,6 +400,8 @@ func (d *streamDecoder) decodeEvents() iter.Seq[api.StreamEvent] {
 					yield(&api.ErrorEvent{Err: fmt.Errorf("notification stream ended unexpectedly")})
 					return
 				}
+
+				observeNotification(notif, d.commandOutputByItemID, &d.commandExecutions, &d.fileChanges)
 
 				event, err := codec.DecodeNotification(notif)
 				if err != nil {
@@ -389,9 +431,16 @@ func (d *streamDecoder) decodeEvents() iter.Seq[api.StreamEvent] {
 						}
 					}
 
+					// Track token usage if tracker is configured
+					if d.tokenTracker != nil {
+						d.tokenTracker.Add(finish.Usage)
+					}
+
 					metadata := &codec.Metadata{
-						ThreadID:  d.threadID,
-						Reasoning: d.reasoning,
+						ThreadID:          d.threadID,
+						Reasoning:         d.reasoning,
+						CommandExecutions: d.commandExecutions,
+						FileChanges:       d.fileChanges,
 					}
 					finish.ProviderMetadata = api.NewProviderMetadata(map[string]any{
 						codec.ProviderName: metadata,
@@ -415,6 +464,57 @@ func (d *streamDecoder) decodeEvents() iter.Seq[api.StreamEvent] {
 	}
 }
 
+// TokenUsage returns cumulative token usage for this model instance.
+func (m *LanguageModel) TokenUsage() api.CLITokenUsage {
+	if m.tokenTracker == nil {
+		return api.CLITokenUsage{}
+	}
+	u := m.tokenTracker.Usage()
+	return api.CLITokenUsage{
+		InputTokens:  u.InputTokens,
+		OutputTokens: u.OutputTokens,
+		TotalTokens:  u.TotalTokens,
+		CachedTokens: u.CachedTokens,
+	}
+}
+
+// ResetTokenUsage clears the cumulative token counters for this model instance.
+func (m *LanguageModel) ResetTokenUsage() {
+	if m.tokenTracker != nil {
+		m.tokenTracker.Reset()
+	}
+}
+
+// ConfigNeedsRestart returns true if the given call options would require restarting the underlying process.
+//
+// Codex app-server configuration is currently process-scoped and does not support per-call tuning via CallOptions.
+func (m *LanguageModel) ConfigNeedsRestart(opts api.CallOptions) bool {
+	_ = opts
+	return false
+}
+
+// IsProcessRunning returns true if the underlying CLI process is running.
+func (m *LanguageModel) IsProcessRunning() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.proc != nil && m.proc.IsRunning()
+}
+
+// RestartProcess stops the current process and starts a new one.
+// The new process will be started on the next Generate or Stream call.
+func (m *LanguageModel) RestartProcess(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.proc != nil {
+		if err := m.proc.Stop(); err != nil {
+			return err
+		}
+		m.proc = nil
+	}
+	return nil
+}
+
 // Close stops the underlying process.
 func (m *LanguageModel) Close() error {
 	m.mu.Lock()
@@ -424,4 +524,81 @@ func (m *LanguageModel) Close() error {
 		return m.proc.Stop()
 	}
 	return nil
+}
+
+type itemCompletedNotification struct {
+	Item struct {
+		ID   string `json:"id"`
+		Type string `json:"type"`
+
+		// commandExecution
+		Command  string `json:"command,omitempty"`
+		ExitCode *int   `json:"exitCode,omitempty"`
+
+		// fileChange
+		Changes []struct {
+			Path string `json:"path"`
+			Diff string `json:"diff"`
+		} `json:"changes,omitempty"`
+	} `json:"item"`
+}
+
+type commandExecutionOutputDeltaNotification struct {
+	ItemID string `json:"itemId"`
+	Delta  string `json:"delta"`
+}
+
+func observeNotification(
+	notif *jsonrpc.Notification,
+	commandOutputByItemID map[string]string,
+	commandExecutions *[]codec.CommandExecution,
+	fileChanges *[]codec.FileChange,
+) {
+	if notif == nil {
+		return
+	}
+
+	switch notif.Method {
+	case codec.NotifyItemCommandExecutionOutputDelta:
+		var p commandExecutionOutputDeltaNotification
+		if err := json.Unmarshal(notif.Params, &p); err != nil {
+			return
+		}
+		if p.ItemID == "" || p.Delta == "" {
+			return
+		}
+		commandOutputByItemID[p.ItemID] += p.Delta
+
+	case codec.NotifyItemCompleted:
+		var p itemCompletedNotification
+		if err := json.Unmarshal(notif.Params, &p); err != nil {
+			return
+		}
+		if p.Item.ID == "" || p.Item.Type == "" {
+			return
+		}
+
+		switch p.Item.Type {
+		case "commandExecution":
+			exec := codec.CommandExecution{
+				Command: p.Item.Command,
+			}
+			if p.Item.ExitCode != nil {
+				exec.ExitCode = *p.Item.ExitCode
+			}
+			if output, ok := commandOutputByItemID[p.Item.ID]; ok {
+				exec.Output = output
+				delete(commandOutputByItemID, p.Item.ID)
+			}
+			*commandExecutions = append(*commandExecutions, exec)
+
+		case "fileChange":
+			for _, change := range p.Item.Changes {
+				*fileChanges = append(*fileChanges, codec.FileChange{
+					FilePath: change.Path,
+					Diff:     change.Diff,
+				})
+			}
+		}
+	}
 }

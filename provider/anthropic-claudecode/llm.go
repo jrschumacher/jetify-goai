@@ -5,10 +5,12 @@ import (
 	"context"
 	"fmt"
 	"iter"
+	"sync"
 
 	"go.jetify.com/ai/api"
 	"go.jetify.com/ai/provider/anthropic-claudecode/codec"
 	"go.jetify.com/ai/provider/anthropic-claudecode/process"
+	"go.jetify.com/ai/provider/internal/cli"
 )
 
 // ModelOption is a function type that modifies a LanguageModel.
@@ -21,13 +23,45 @@ func WithProcess(proc process.Process) ModelOption {
 	}
 }
 
-// LanguageModel represents a Claude Code language model.
-type LanguageModel struct {
-	modelID string
-	proc    process.Process
+// WithRetryPolicy sets a custom retry policy for handling transient failures.
+func WithRetryPolicy(policy *RetryPolicy) ModelOption {
+	return func(m *LanguageModel) {
+		m.retryPolicy = policy
+	}
 }
 
-var _ api.LanguageModel = &LanguageModel{}
+// WithTokenTracker sets a token tracker for monitoring token usage.
+func WithTokenTracker(tracker *cli.TokenTracker) ModelOption {
+	return func(m *LanguageModel) {
+		m.tokenTracker = tracker
+	}
+}
+
+// LanguageModel represents a Claude Code language model.
+// It maintains a persistent process for efficient streaming and multi-turn conversations.
+type LanguageModel struct {
+	mu sync.Mutex
+
+	modelID string
+	proc    process.Process
+
+	// cachedKey tracks the config used to start the current process.
+	// If options change, the process is restarted.
+	cachedKey cli.ConfigKey
+
+	// retryPolicy defines how operations should be retried on failure.
+	retryPolicy *RetryPolicy
+
+	// tokenTracker tracks token usage across the session.
+	tokenTracker *cli.TokenTracker
+}
+
+var (
+	_ api.LanguageModel    = &LanguageModel{}
+	_ api.CLILanguageModel = &LanguageModel{}
+	_ api.CLITokenTracker  = &LanguageModel{}
+	_ api.CLIConfigAware   = &LanguageModel{}
+)
 
 // NewLanguageModel creates a new Claude Code language model.
 func NewLanguageModel(modelID string, opts ...ModelOption) *LanguageModel {
@@ -58,6 +92,84 @@ func (m *LanguageModel) SupportedUrls() []api.SupportedURL {
 	return nil
 }
 
+// buildConfig creates a process config from the current options.
+func (m *LanguageModel) buildConfig(systemPrompt string, opts api.CallOptions) *process.Config {
+	cfg := &process.Config{
+		Model:        m.modelID,
+		SystemPrompt: systemPrompt,
+		Verbose:      true, // Default for streaming
+	}
+	if opts.Temperature != nil {
+		cfg.Temperature = opts.Temperature
+	}
+	return cfg
+}
+
+// ensureProcess ensures a running process with the correct config.
+// If the config has changed, the existing process is stopped and a new one started.
+func (m *LanguageModel) ensureProcess(ctx context.Context, cfg *process.Config) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	newKey := cfg.ConfigKey()
+
+	// Check if we need to restart due to config change
+	if m.proc != nil && m.proc.IsRunning() {
+		if cli.ConfigKeysEqual(m.cachedKey, newKey) {
+			return nil // Config unchanged, reuse existing process
+		}
+		// Config changed, stop the old process
+		m.proc.Stop()
+		m.proc = nil
+	}
+
+	// Create new process if needed
+	if m.proc == nil {
+		procOpts := []process.Option{
+			process.WithModel(cfg.Model),
+			process.WithVerbose(cfg.Verbose),
+		}
+		if cfg.SystemPrompt != "" {
+			procOpts = append(procOpts, process.WithSystemPrompt(cfg.SystemPrompt))
+		}
+		if cfg.Temperature != nil {
+			procOpts = append(procOpts, process.WithTemperature(*cfg.Temperature))
+		}
+		if cfg.WorkDir != "" {
+			procOpts = append(procOpts, process.WithWorkDir(cfg.WorkDir))
+		}
+		if cfg.JSONSchema != "" {
+			procOpts = append(procOpts, process.WithJSONSchema(cfg.JSONSchema))
+		}
+		m.proc = process.NewCLIProcess(procOpts...)
+	}
+
+	// Start the process if not running, with retry logic if configured
+	if !m.proc.IsRunning() {
+		startFn := func() error {
+			if err := m.proc.Start(ctx); err != nil {
+				return WrapError(fmt.Errorf("failed to start CLI process: %w", err))
+			}
+			return nil
+		}
+
+		// Use retry policy if configured, otherwise execute once
+		var err error
+		if m.retryPolicy != nil {
+			err = m.retryPolicy.Execute(ctx, startFn)
+		} else {
+			err = startFn()
+		}
+
+		if err != nil {
+			return err
+		}
+	}
+
+	m.cachedKey = newKey
+	return nil
+}
+
 // Generate generates a response from the model.
 func (m *LanguageModel) Generate(
 	ctx context.Context, prompt []api.Message, opts api.CallOptions,
@@ -65,36 +177,24 @@ func (m *LanguageModel) Generate(
 	// Extract system prompt from messages
 	systemPrompt, messages := codec.ExtractSystemPrompt(prompt)
 
-	// Get or create process
-	proc := m.proc
-	if proc == nil {
-		procOpts := []process.Option{
-			process.WithModel(m.modelID),
-		}
-		if systemPrompt != "" {
-			procOpts = append(procOpts, process.WithSystemPrompt(systemPrompt))
-		}
-		if opts.Temperature != nil {
-			procOpts = append(procOpts, process.WithTemperature(*opts.Temperature))
-		}
-		proc = process.NewCLIProcess(procOpts...)
+	// Build config and ensure process
+	cfg := m.buildConfig(systemPrompt, opts)
+	if err := m.ensureProcess(ctx, cfg); err != nil {
+		return nil, err
 	}
 
-	// Start the process if not running
-	if !proc.IsRunning() {
-		if err := proc.Start(ctx); err != nil {
-			return nil, fmt.Errorf("failed to start CLI process: %w", err)
-		}
-	}
+	m.mu.Lock()
+	proc := m.proc
+	m.mu.Unlock()
 
 	// Send messages to the CLI
 	for _, msg := range messages {
 		encoded, err := codec.EncodeMessage(msg)
 		if err != nil {
-			return nil, fmt.Errorf("failed to encode message: %w", err)
+			return nil, WrapError(fmt.Errorf("failed to encode message: %w", err))
 		}
 		if _, err := proc.Stdin().Write(append(encoded, '\n')); err != nil {
-			return nil, fmt.Errorf("failed to write to CLI: %w", err)
+			return nil, WrapError(fmt.Errorf("failed to write to CLI: %w", err))
 		}
 	}
 
@@ -108,7 +208,7 @@ func (m *LanguageModel) Generate(
 
 		event, err := codec.ParseEvent(line)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse event: %w", err)
+			return nil, WrapError(fmt.Errorf("failed to parse event: %w", err))
 		}
 
 		// Handle system init - capture session ID
@@ -119,17 +219,31 @@ func (m *LanguageModel) Generate(
 
 		// Handle result event
 		if event.Type == codec.EventTypeResult {
-			return codec.DecodeResponse(event)
+			resp, err := codec.DecodeResponse(event)
+			if err != nil {
+				return nil, WrapError(err)
+			}
+
+			// Track token usage if tracker is configured
+			if m.tokenTracker != nil && resp != nil {
+				m.tokenTracker.Add(resp.Usage)
+			}
+
+			if resp != nil {
+				resp.Warnings = append(resp.Warnings, callOptionWarnings(opts)...)
+			}
+
+			return resp, nil
 		}
 
 		// Skip other events (assistant, stream_event) for non-streaming Generate
 	}
 
 	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("error reading CLI output: %w", err)
+		return nil, WrapError(fmt.Errorf("error reading CLI output: %w", err))
 	}
 
-	return nil, fmt.Errorf("CLI exited without returning a result")
+	return nil, WrapError(fmt.Errorf("CLI exited without returning a result"))
 }
 
 // Stream generates a streaming response from the model.
@@ -139,42 +253,31 @@ func (m *LanguageModel) Stream(
 	// Extract system prompt from messages
 	systemPrompt, messages := codec.ExtractSystemPrompt(prompt)
 
-	// Get or create process
-	proc := m.proc
-	if proc == nil {
-		procOpts := []process.Option{
-			process.WithModel(m.modelID),
-		}
-		if systemPrompt != "" {
-			procOpts = append(procOpts, process.WithSystemPrompt(systemPrompt))
-		}
-		if opts.Temperature != nil {
-			procOpts = append(procOpts, process.WithTemperature(*opts.Temperature))
-		}
-		proc = process.NewCLIProcess(procOpts...)
+	// Build config and ensure process
+	cfg := m.buildConfig(systemPrompt, opts)
+	if err := m.ensureProcess(ctx, cfg); err != nil {
+		return nil, err
 	}
 
-	// Start the process if not running
-	if !proc.IsRunning() {
-		if err := proc.Start(ctx); err != nil {
-			return nil, fmt.Errorf("failed to start CLI process: %w", err)
-		}
-	}
+	m.mu.Lock()
+	proc := m.proc
+	m.mu.Unlock()
 
 	// Send messages to the CLI
 	for _, msg := range messages {
 		encoded, err := codec.EncodeMessage(msg)
 		if err != nil {
-			return nil, fmt.Errorf("failed to encode message: %w", err)
+			return nil, WrapError(fmt.Errorf("failed to encode message: %w", err))
 		}
 		if _, err := proc.Stdin().Write(append(encoded, '\n')); err != nil {
-			return nil, fmt.Errorf("failed to write to CLI: %w", err)
+			return nil, WrapError(fmt.Errorf("failed to write to CLI: %w", err))
 		}
 	}
 
 	// Create the stream decoder
 	decoder := &streamDecoder{
-		proc: proc,
+		proc:         proc,
+		tokenTracker: m.tokenTracker,
 	}
 
 	return &api.StreamResponse{
@@ -182,13 +285,87 @@ func (m *LanguageModel) Stream(
 	}, nil
 }
 
+// IsProcessRunning returns true if the underlying CLI process is running.
+func (m *LanguageModel) IsProcessRunning() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.proc != nil && m.proc.IsRunning()
+}
+
+// RestartProcess stops the current process and starts a new one.
+// The new process will be started on the next Generate or Stream call.
+func (m *LanguageModel) RestartProcess(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.proc != nil {
+		if err := m.proc.Stop(); err != nil {
+			return err
+		}
+		m.proc = nil
+	}
+	return nil
+}
+
+// TokenUsage returns cumulative token usage for this model instance.
+func (m *LanguageModel) TokenUsage() api.CLITokenUsage {
+	if m.tokenTracker == nil {
+		return api.CLITokenUsage{}
+	}
+	u := m.tokenTracker.Usage()
+	return api.CLITokenUsage{
+		InputTokens:  u.InputTokens,
+		OutputTokens: u.OutputTokens,
+		TotalTokens:  u.TotalTokens,
+		CachedTokens: u.CachedTokens,
+	}
+}
+
+// ResetTokenUsage clears the cumulative token counters for this model instance.
+func (m *LanguageModel) ResetTokenUsage() {
+	if m.tokenTracker != nil {
+		m.tokenTracker.Reset()
+	}
+}
+
+// ConfigNeedsRestart returns true if the given call options would require restarting the underlying process.
+// Currently, only temperature changes require a restart.
+func (m *LanguageModel) ConfigNeedsRestart(opts api.CallOptions) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.proc == nil || !m.proc.IsRunning() {
+		return false
+	}
+
+	var temp float64
+	hasTemp := opts.Temperature != nil
+	if hasTemp {
+		temp = *opts.Temperature
+	}
+
+	return m.cachedKey.Temperature != temp || m.cachedKey.HasTemp != hasTemp
+}
+
+// Close stops the underlying process.
+func (m *LanguageModel) Close() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.proc != nil {
+		return m.proc.Stop()
+	}
+	return nil
+}
+
 // streamDecoder maintains state while decoding a stream of Claude Code CLI events.
 type streamDecoder struct {
-	proc       process.Process
-	sessionID  string
-	responseID string
-	modelID    string
-	usage      api.Usage
+	proc         process.Process
+	sessionID    string
+	responseID   string
+	modelID      string
+	usage        api.Usage
+	tokenTracker *cli.TokenTracker
 }
 
 // decodeEvents returns an iterator that yields events from the CLI stream.
@@ -204,7 +381,7 @@ func (d *streamDecoder) decodeEvents() iter.Seq[api.StreamEvent] {
 
 			event, err := codec.ParseEvent(line)
 			if err != nil {
-				if !yield(&api.ErrorEvent{Err: fmt.Errorf("failed to parse event: %w", err)}) {
+				if !yield(&api.ErrorEvent{Err: WrapError(fmt.Errorf("failed to parse event: %w", err))}) {
 					return
 				}
 				continue
@@ -221,7 +398,7 @@ func (d *streamDecoder) decodeEvents() iter.Seq[api.StreamEvent] {
 			if event.Type == codec.EventTypeResult {
 				// Check for errors
 				if event.IsError || event.Subtype == "error" {
-					yield(&api.ErrorEvent{Err: fmt.Errorf("claude code error: %s", event.Result)})
+					yield(&api.ErrorEvent{Err: WrapError(fmt.Errorf("claude code error: %s", event.Result))})
 					return
 				}
 
@@ -232,6 +409,11 @@ func (d *streamDecoder) decodeEvents() iter.Seq[api.StreamEvent] {
 						OutputTokens:      event.Usage.OutputTokens,
 						TotalTokens:       event.Usage.InputTokens + event.Usage.OutputTokens,
 						CachedInputTokens: event.Usage.CacheReadInputTokens,
+					}
+
+					// Track token usage if tracker is configured
+					if d.tokenTracker != nil {
+						d.tokenTracker.Add(d.usage)
 					}
 				}
 
@@ -283,7 +465,7 @@ func (d *streamDecoder) decodeEvents() iter.Seq[api.StreamEvent] {
 			if event.Type == codec.EventTypeStreamEvent {
 				streamEvent, err := codec.DecodeStreamEvent(event)
 				if err != nil {
-					if !yield(&api.ErrorEvent{Err: err}) {
+					if !yield(&api.ErrorEvent{Err: WrapError(err)}) {
 						return
 					}
 					continue
@@ -309,7 +491,7 @@ func (d *streamDecoder) decodeEvents() iter.Seq[api.StreamEvent] {
 		}
 
 		if err := scanner.Err(); err != nil {
-			yield(&api.ErrorEvent{Err: fmt.Errorf("error reading CLI output: %w", err)})
+			yield(&api.ErrorEvent{Err: WrapError(fmt.Errorf("error reading CLI output: %w", err))})
 		}
 	}
 }

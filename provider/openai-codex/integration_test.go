@@ -555,7 +555,7 @@ func TestIntegration_ProcessRestartOnConfigChange(t *testing.T) {
 		"different requests should have different thread IDs")
 }
 
-func TestIntegration_TemperatureBoundaries(t *testing.T) {
+func TestIntegration_TemperatureIgnored(t *testing.T) {
 	model := NewLanguageModel("")
 
 	prompt := []api.Message{
@@ -567,28 +567,28 @@ func TestIntegration_TemperatureBoundaries(t *testing.T) {
 	}
 
 	tests := []struct {
-		name  string
-		temp  float64
-		valid bool
+		name string
+		temp float64
 	}{
-		{"zero", 0.0, true},
-		{"half", 0.5, true},
-		{"one", 1.0, true},
-		{"negative", -0.1, false},
-		{"too_high", 2.0, false},
+		{"zero", 0.0},
+		{"half", 0.5},
+		{"one", 1.0},
+		{"negative", -0.1},
+		{"too_high", 2.0},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := model.Generate(context.Background(), prompt, api.CallOptions{
+			resp, err := model.Generate(context.Background(), prompt, api.CallOptions{
 				Temperature: &tt.temp,
 			})
+			require.NoError(t, err)
+			require.NotNil(t, resp)
 
-			if tt.valid {
-				assert.NoError(t, err, "temperature %.1f should be valid", tt.temp)
-			} else {
-				assert.Error(t, err, "temperature %.1f should be invalid", tt.temp)
-			}
+			// Codex app-server does not support per-call temperature; it should be ignored with a warning.
+			require.NotEmpty(t, resp.Warnings)
+			assert.True(t, containsWarning(resp.Warnings, "temperature"),
+				"expected unsupported-setting warning for temperature")
 		})
 	}
 }
@@ -628,4 +628,13 @@ func extractJSON(text string) string {
 		return matches[1]
 	}
 	return text
+}
+
+func containsWarning(warnings []api.CallWarning, setting string) bool {
+	for _, w := range warnings {
+		if w.Type == "unsupported-setting" && w.Setting == setting {
+			return true
+		}
+	}
+	return false
 }

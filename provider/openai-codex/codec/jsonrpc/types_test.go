@@ -130,12 +130,17 @@ func TestInput_Marshal(t *testing.T) {
 
 func TestApprovalPolicy_Constants(t *testing.T) {
 	assert.Equal(t, ApprovalPolicy("never"), ApprovalNever)
-	assert.Equal(t, ApprovalPolicy("always"), ApprovalAlways)
-	assert.Equal(t, ApprovalPolicy("once"), ApprovalOnce)
+	assert.Equal(t, ApprovalPolicy("onRequest"), ApprovalOnRequest)
+	assert.Equal(t, ApprovalPolicy("onFailure"), ApprovalOnFailure)
+	assert.Equal(t, ApprovalPolicy("unlessTrusted"), ApprovalUnlessTrusted)
+
+	// Legacy constants map to a valid modern value.
+	assert.Equal(t, ApprovalOnRequest, ApprovalAlways)
+	assert.Equal(t, ApprovalOnRequest, ApprovalOnce)
 }
 
 func TestThreadStartResult_Unmarshal(t *testing.T) {
-	data := `{"thread":{"id":"thread-123"},"model":"gpt-5.2-codex-max"}`
+	data := `{"approvalPolicy":"never","cwd":"/tmp","model":"gpt-5.2-codex-max","modelProvider":"openai","sandbox":{"type":"readOnly"},"thread":{"id":"thread-123"}}`
 
 	var result ThreadStartResult
 	err := json.Unmarshal([]byte(data), &result)
