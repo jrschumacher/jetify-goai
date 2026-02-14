@@ -4,7 +4,10 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"iter"
+	"log/slog"
+	"strings"
 	"sync"
 
 	"go.jetify.com/ai/api"
@@ -37,6 +40,13 @@ func WithTokenTracker(tracker *cli.TokenTracker) ModelOption {
 	}
 }
 
+// WithLogger sets the structured logger for the language model and its processes.
+func WithLogger(logger *slog.Logger) ModelOption {
+	return func(m *LanguageModel) {
+		m.logger = logger
+	}
+}
+
 // LanguageModel represents a Claude Code language model.
 // It maintains a persistent process for efficient streaming and multi-turn conversations.
 type LanguageModel struct {
@@ -44,6 +54,7 @@ type LanguageModel struct {
 
 	modelID string
 	proc    process.Process
+	logger  *slog.Logger
 
 	// cachedKey tracks the config used to start the current process.
 	// If options change, the process is restarted.
@@ -73,6 +84,10 @@ func NewLanguageModel(modelID string, opts ...ModelOption) *LanguageModel {
 		opt(model)
 	}
 
+	if model.logger == nil {
+		model.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+
 	return model
 }
 
@@ -98,6 +113,7 @@ func (m *LanguageModel) buildConfig(systemPrompt string, opts api.CallOptions) *
 		Model:        m.modelID,
 		SystemPrompt: systemPrompt,
 		Verbose:      true, // Default for streaming
+		Logger:       m.logger,
 	}
 	if opts.Temperature != nil {
 		cfg.Temperature = opts.Temperature
@@ -116,18 +132,22 @@ func (m *LanguageModel) ensureProcess(ctx context.Context, cfg *process.Config) 
 	// Check if we need to restart due to config change
 	if m.proc != nil && m.proc.IsRunning() {
 		if cli.ConfigKeysEqual(m.cachedKey, newKey) {
+			m.logger.Debug("reusing existing process")
 			return nil // Config unchanged, reuse existing process
 		}
 		// Config changed, stop the old process
+		m.logger.Info("config changed, restarting process")
 		m.proc.Stop()
 		m.proc = nil
 	}
 
 	// Create new process if needed
 	if m.proc == nil {
+		m.logger.Debug("creating new process", "model", cfg.Model)
 		procOpts := []process.Option{
 			process.WithModel(cfg.Model),
 			process.WithVerbose(cfg.Verbose),
+			process.WithLogger(m.logger),
 		}
 		if cfg.SystemPrompt != "" {
 			procOpts = append(procOpts, process.WithSystemPrompt(cfg.SystemPrompt))
@@ -146,6 +166,7 @@ func (m *LanguageModel) ensureProcess(ctx context.Context, cfg *process.Config) 
 
 	// Start the process if not running, with retry logic if configured
 	if !m.proc.IsRunning() {
+		m.logger.Info("starting process", "model", cfg.Model)
 		startFn := func() error {
 			if err := m.proc.Start(ctx); err != nil {
 				return WrapError(fmt.Errorf("failed to start CLI process: %w", err))
@@ -168,6 +189,18 @@ func (m *LanguageModel) ensureProcess(ctx context.Context, cfg *process.Config) 
 
 	m.cachedKey = newKey
 	return nil
+}
+
+// drainStderr reads any available stderr content from the process.
+// Useful for surfacing actual CLI error messages when stdin/stdout operations fail.
+func drainStderr(proc process.Process) string {
+	stderr := proc.Stderr()
+	if stderr == nil {
+		return ""
+	}
+	data, _ := io.ReadAll(io.LimitReader(stderr, 4096))
+	msg := strings.TrimSpace(string(data))
+	return msg
 }
 
 // Generate generates a response from the model.
@@ -194,7 +227,12 @@ func (m *LanguageModel) Generate(
 			return nil, WrapError(fmt.Errorf("failed to encode message: %w", err))
 		}
 		if _, err := proc.Stdin().Write(append(encoded, '\n')); err != nil {
-			return nil, WrapError(fmt.Errorf("failed to write to CLI: %w", err))
+			stderrMsg := drainStderr(proc)
+			m.logger.Error("failed to write to CLI stdin", "error", err, "stderr", stderrMsg, "processRunning", proc.IsRunning())
+			if stderrMsg != "" {
+				return nil, WrapError(fmt.Errorf("CLI process error (stderr: %s): %w", stderrMsg, err))
+			}
+			return nil, WrapError(fmt.Errorf("failed to write to CLI stdin (process running=%v): %w", proc.IsRunning(), err))
 		}
 	}
 
@@ -214,6 +252,7 @@ func (m *LanguageModel) Generate(
 		// Handle system init - capture session ID
 		if event.Type == codec.EventTypeSystem && event.Subtype == "init" {
 			proc.SetSessionID(event.SessionID)
+			m.logger.Debug("session initialized", "sessionID", event.SessionID)
 			continue
 		}
 
@@ -240,9 +279,19 @@ func (m *LanguageModel) Generate(
 	}
 
 	if err := scanner.Err(); err != nil {
+		stderrMsg := drainStderr(proc)
+		m.logger.Error("error reading CLI output", "error", err, "stderr", stderrMsg)
+		if stderrMsg != "" {
+			return nil, WrapError(fmt.Errorf("CLI process error (stderr: %s): %w", stderrMsg, err))
+		}
 		return nil, WrapError(fmt.Errorf("error reading CLI output: %w", err))
 	}
 
+	stderrMsg := drainStderr(proc)
+	if stderrMsg != "" {
+		m.logger.Warn("CLI exited without result", "stderr", stderrMsg)
+		return nil, WrapError(fmt.Errorf("CLI exited without returning a result (stderr: %s)", stderrMsg))
+	}
 	return nil, WrapError(fmt.Errorf("CLI exited without returning a result"))
 }
 
@@ -270,13 +319,19 @@ func (m *LanguageModel) Stream(
 			return nil, WrapError(fmt.Errorf("failed to encode message: %w", err))
 		}
 		if _, err := proc.Stdin().Write(append(encoded, '\n')); err != nil {
-			return nil, WrapError(fmt.Errorf("failed to write to CLI: %w", err))
+			stderrMsg := drainStderr(proc)
+			m.logger.Error("failed to write to CLI stdin", "error", err, "stderr", stderrMsg, "processRunning", proc.IsRunning())
+			if stderrMsg != "" {
+				return nil, WrapError(fmt.Errorf("CLI process error (stderr: %s): %w", stderrMsg, err))
+			}
+			return nil, WrapError(fmt.Errorf("failed to write to CLI stdin (process running=%v): %w", proc.IsRunning(), err))
 		}
 	}
 
 	// Create the stream decoder
 	decoder := &streamDecoder{
 		proc:         proc,
+		logger:       m.logger,
 		tokenTracker: m.tokenTracker,
 	}
 
@@ -299,6 +354,7 @@ func (m *LanguageModel) RestartProcess(ctx context.Context) error {
 	defer m.mu.Unlock()
 
 	if m.proc != nil {
+		m.logger.Info("restarting process")
 		if err := m.proc.Stop(); err != nil {
 			return err
 		}
@@ -361,6 +417,7 @@ func (m *LanguageModel) Close() error {
 // streamDecoder maintains state while decoding a stream of Claude Code CLI events.
 type streamDecoder struct {
 	proc         process.Process
+	logger       *slog.Logger
 	sessionID    string
 	responseID   string
 	modelID      string
@@ -391,6 +448,7 @@ func (d *streamDecoder) decodeEvents() iter.Seq[api.StreamEvent] {
 			if event.Type == codec.EventTypeSystem && event.Subtype == "init" {
 				d.sessionID = event.SessionID
 				d.proc.SetSessionID(event.SessionID)
+				d.logger.Debug("stream session initialized", "sessionID", event.SessionID)
 				continue
 			}
 
@@ -491,7 +549,13 @@ func (d *streamDecoder) decodeEvents() iter.Seq[api.StreamEvent] {
 		}
 
 		if err := scanner.Err(); err != nil {
-			yield(&api.ErrorEvent{Err: WrapError(fmt.Errorf("error reading CLI output: %w", err))})
+			stderrMsg := drainStderr(d.proc)
+			d.logger.Error("error reading CLI stream", "error", err, "stderr", stderrMsg)
+			if stderrMsg != "" {
+				yield(&api.ErrorEvent{Err: WrapError(fmt.Errorf("CLI process error (stderr: %s): %w", stderrMsg, err))})
+			} else {
+				yield(&api.ErrorEvent{Err: WrapError(fmt.Errorf("error reading CLI output: %w", err))})
+			}
 		}
 	}
 }

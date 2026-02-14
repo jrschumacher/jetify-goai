@@ -4,6 +4,7 @@ package process
 import (
 	"context"
 	"io"
+	"log/slog"
 
 	"go.jetify.com/ai/provider/internal/cli"
 )
@@ -69,6 +70,10 @@ type Config struct {
 
 	// MaxTurns limits the number of conversation turns.
 	MaxTurns int
+
+	// Logger is the structured logger for process lifecycle events.
+	// If nil, a discard logger is used.
+	Logger *slog.Logger
 }
 
 // Option is a function that modifies Config.
@@ -127,6 +132,13 @@ func WithVerbose(verbose bool) Option {
 func WithMaxTurns(turns int) Option {
 	return func(c *Config) {
 		c.MaxTurns = turns
+	}
+}
+
+// WithLogger sets the structured logger for process lifecycle events.
+func WithLogger(logger *slog.Logger) Option {
+	return func(c *Config) {
+		c.Logger = logger
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"sync"
@@ -16,6 +17,7 @@ type CLIProcess struct {
 
 	config *Config
 	cmd    *exec.Cmd
+	logger *slog.Logger
 
 	stdin  io.WriteCloser
 	stdout io.ReadCloser
@@ -30,8 +32,14 @@ var _ Process = &CLIProcess{}
 
 // NewCLIProcess creates a new CLI process with the given configuration.
 func NewCLIProcess(opts ...Option) *CLIProcess {
+	cfg := NewConfig(opts...)
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
 	return &CLIProcess{
-		config: NewConfig(opts...),
+		config: cfg,
+		logger: logger,
 	}
 }
 
@@ -45,6 +53,7 @@ func (p *CLIProcess) Start(ctx context.Context) error {
 	}
 
 	args := p.buildArgs()
+	p.logger.Info("starting claude CLI", "args", args, "workdir", p.config.WorkDir)
 	p.cmd = exec.CommandContext(ctx, "claude", args...)
 
 	// Set working directory for sandboxing
@@ -71,9 +80,11 @@ func (p *CLIProcess) Start(ctx context.Context) error {
 
 	// Start the process
 	if err := p.cmd.Start(); err != nil {
+		p.logger.Error("failed to start claude CLI", "error", err)
 		return fmt.Errorf("failed to start claude CLI: %w", err)
 	}
 
+	p.logger.Info("claude CLI started", "pid", p.cmd.Process.Pid)
 	p.running = true
 	p.waited = false
 
@@ -82,11 +93,20 @@ func (p *CLIProcess) Start(ctx context.Context) error {
 	// exits (e.g., print-mode exits after producing a result) and
 	// ensureProcess incorrectly reuses the dead process.
 	go func() {
-		_ = p.cmd.Wait()
+		err := p.cmd.Wait()
 		p.mu.Lock()
+		pid := 0
+		if p.cmd != nil && p.cmd.Process != nil {
+			pid = p.cmd.Process.Pid
+		}
 		p.running = false
 		p.waited = true
 		p.mu.Unlock()
+		if err != nil {
+			p.logger.Warn("claude CLI exited with error", "pid", pid, "error", err)
+		} else {
+			p.logger.Info("claude CLI exited", "pid", pid)
+		}
 	}()
 
 	return nil
@@ -151,6 +171,7 @@ func (p *CLIProcess) Stop() error {
 			p.waited = true
 			cmd := p.cmd
 			p.mu.Unlock()
+			p.logger.Debug("reaping already-stopped process")
 			_ = cmd.Wait()
 			return nil
 		}
@@ -158,6 +179,7 @@ func (p *CLIProcess) Stop() error {
 		return nil
 	}
 
+	p.logger.Info("stopping claude CLI")
 	p.running = false
 	stdin := p.stdin
 	cmd := p.cmd

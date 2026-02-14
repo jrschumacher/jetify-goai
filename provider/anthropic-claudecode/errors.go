@@ -2,6 +2,7 @@ package claudecode
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -35,7 +36,7 @@ type ClaudeCodeClassifier struct {
 // NewClaudeCodeClassifier creates a new Claude Code specific error classifier.
 func NewClaudeCodeClassifier() *ClaudeCodeClassifier {
 	return &ClaudeCodeClassifier{
-		BaseClassifier: cli.NewBaseClassifier("Anthropic", "claude login"),
+		BaseClassifier: cli.NewBaseClassifier("Claude Code", "claude login"),
 	}
 }
 
@@ -78,20 +79,66 @@ func (c *ClaudeCodeClassifier) Classify(err error) *cli.ErrorInfo {
 		}
 	}
 
-	// Claude Code specific: Claude CLI process failures
-	if strings.Contains(errMsg, "claude") && strings.Contains(errMsg, "cli") {
+	// Claude Code specific: actual process start failures
+	// Only match when the error is explicitly about starting the CLI,
+	// not about writing to or reading from a running process.
+	if strings.Contains(errMsg, "failed to start") && strings.Contains(errMsg, "claude") {
 		return &cli.ErrorInfo{
 			Category:        cli.CategoryProcessFailure,
 			UserMessage:     "Failed to start Claude CLI process",
-			SuggestedAction: "Ensure 'claude' CLI is installed and accessible",
+			SuggestedAction: "Ensure 'claude' CLI is installed and in your PATH",
 			Retryable:       true,
 			RetryAfter:      5 * time.Second,
 			OriginalError:   err,
 		}
 	}
 
+	// Dead process / broken pipe: the process exited but caller tried to use it.
+	if strings.Contains(errMsg, "broken pipe") ||
+		strings.Contains(errMsg, "process running=false") {
+		return &cli.ErrorInfo{
+			Category:        cli.CategoryProcessFailure,
+			UserMessage:     "Claude CLI process exited unexpectedly",
+			SuggestedAction: "The process may have crashed; retry will start a new one",
+			Retryable:       true,
+			RetryAfter:      time.Second,
+			OriginalError:   err,
+		}
+	}
+
+	// Stderr content surfaced from the CLI
+	if strings.Contains(errMsg, "stderr:") {
+		// Extract the stderr portion for the user message
+		stderrContent := extractStderr(errMsg)
+		return &cli.ErrorInfo{
+			Category:        cli.CategoryProcessFailure,
+			UserMessage:     fmt.Sprintf("Claude CLI error: %s", stderrContent),
+			SuggestedAction: "Check the error details and retry",
+			Retryable:       true,
+			RetryAfter:      2 * time.Second,
+			OriginalError:   err,
+		}
+	}
+
 	// Fall back to base classification
 	return c.BaseClassifier.Classify(err)
+}
+
+// extractStderr pulls the stderr content from an error message like
+// "CLI process error (stderr: some message): broken pipe"
+func extractStderr(errMsg string) string {
+	start := strings.Index(errMsg, "stderr:")
+	if start == -1 {
+		return errMsg
+	}
+	start += len("stderr:")
+	rest := errMsg[start:]
+	rest = strings.TrimSpace(rest)
+	// Trim trailing "): ..." if present
+	if end := strings.Index(rest, "):"); end != -1 {
+		rest = rest[:end]
+	}
+	return strings.TrimSpace(rest)
 }
 
 // DefaultClassifier is the default error classifier for the Claude Code provider.
