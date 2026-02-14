@@ -22,6 +22,7 @@ type CLIProcess struct {
 	stderr io.ReadCloser
 
 	running   bool
+	waited    bool // true after cmd.Wait() has been called
 	sessionID string
 }
 
@@ -74,6 +75,20 @@ func (p *CLIProcess) Start(ctx context.Context) error {
 	}
 
 	p.running = true
+	p.waited = false
+
+	// Monitor process exit so IsRunning() reflects reality.
+	// Without this goroutine the running flag stays true after the CLI
+	// exits (e.g., print-mode exits after producing a result) and
+	// ensureProcess incorrectly reuses the dead process.
+	go func() {
+		_ = p.cmd.Wait()
+		p.mu.Lock()
+		p.running = false
+		p.waited = true
+		p.mu.Unlock()
+	}()
+
 	return nil
 }
 
@@ -127,24 +142,47 @@ func (p *CLIProcess) buildArgs() []string {
 // Stop implements Process.Stop.
 func (p *CLIProcess) Stop() error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 
 	if !p.running {
+		// Process already stopped (either via Stop or the reaper goroutine).
+		// If the reaper already called Wait, nothing to do.
+		// If we stopped but haven't waited, reap now to avoid zombies.
+		if !p.waited && p.cmd != nil {
+			p.waited = true
+			cmd := p.cmd
+			p.mu.Unlock()
+			_ = cmd.Wait()
+			return nil
+		}
+		p.mu.Unlock()
 		return nil
 	}
 
-	// Close stdin to signal EOF to the process
-	if p.stdin != nil {
-		p.stdin.Close()
-	}
-
-	// Wait for the process to exit
-	if p.cmd != nil && p.cmd.Process != nil {
-		// Send interrupt signal first
-		p.cmd.Process.Signal(os.Interrupt)
-	}
-
 	p.running = false
+	stdin := p.stdin
+	cmd := p.cmd
+	waited := p.waited
+	p.mu.Unlock()
+
+	// Close stdin to signal EOF to the process
+	if stdin != nil {
+		stdin.Close()
+	}
+
+	if cmd != nil && cmd.Process != nil {
+		// Send interrupt signal
+		_ = cmd.Process.Signal(os.Interrupt)
+
+		// Reap the process if the reaper goroutine hasn't already.
+		// This prevents zombie processes.
+		if !waited {
+			_ = cmd.Wait()
+			p.mu.Lock()
+			p.waited = true
+			p.mu.Unlock()
+		}
+	}
+
 	return nil
 }
 
@@ -174,7 +212,13 @@ func (p *CLIProcess) Wait() error {
 	if p.cmd == nil {
 		return nil
 	}
-	return p.cmd.Wait()
+	// The reaper goroutine already calls cmd.Wait(). Calling it again
+	// is safe (returns the same result) but we track it to avoid races.
+	err := p.cmd.Wait()
+	p.mu.Lock()
+	p.waited = true
+	p.mu.Unlock()
+	return err
 }
 
 // IsRunning implements Process.IsRunning.
