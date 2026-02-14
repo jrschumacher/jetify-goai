@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"time"
 )
 
 // CLIProcess is the real implementation of Process that spawns the Claude CLI.
@@ -24,7 +25,8 @@ type CLIProcess struct {
 	stderr io.ReadCloser
 
 	running   bool
-	waited    bool // true after cmd.Wait() has been called
+	reaped    chan struct{} // closed by the reaper goroutine after cmd.Wait() returns
+	waitErr   error        // result of cmd.Wait(), valid after reaped is closed
 	sessionID string
 }
 
@@ -86,24 +88,25 @@ func (p *CLIProcess) Start(ctx context.Context) error {
 
 	p.logger.Info("claude CLI started", "pid", p.cmd.Process.Pid)
 	p.running = true
-	p.waited = false
+	p.reaped = make(chan struct{})
 
 	// Monitor process exit so IsRunning() reflects reality.
-	// Without this goroutine the running flag stays true after the CLI
-	// exits (e.g., print-mode exits after producing a result) and
-	// ensureProcess incorrectly reuses the dead process.
+	// This is the ONLY goroutine that calls cmd.Wait(). All other code
+	// that needs to wait for exit blocks on the reaped channel instead.
 	go func() {
-		err := p.cmd.Wait()
+		waitErr := p.cmd.Wait()
 		p.mu.Lock()
 		pid := 0
 		if p.cmd != nil && p.cmd.Process != nil {
 			pid = p.cmd.Process.Pid
 		}
 		p.running = false
-		p.waited = true
+		p.waitErr = waitErr
 		p.mu.Unlock()
-		if err != nil {
-			p.logger.Warn("claude CLI exited with error", "pid", pid, "error", err)
+		// Close the channel AFTER updating state so readers see consistent state.
+		close(p.reaped)
+		if waitErr != nil {
+			p.logger.Warn("claude CLI exited with error", "pid", pid, "error", waitErr)
 		} else {
 			p.logger.Info("claude CLI exited", "pid", pid)
 		}
@@ -164,18 +167,12 @@ func (p *CLIProcess) Stop() error {
 	p.mu.Lock()
 
 	if !p.running {
-		// Process already stopped (either via Stop or the reaper goroutine).
-		// If the reaper already called Wait, nothing to do.
-		// If we stopped but haven't waited, reap now to avoid zombies.
-		if !p.waited && p.cmd != nil {
-			p.waited = true
-			cmd := p.cmd
-			p.mu.Unlock()
-			p.logger.Debug("reaping already-stopped process")
-			_ = cmd.Wait()
-			return nil
-		}
+		reaped := p.reaped
 		p.mu.Unlock()
+		// If there's a reaper channel, wait for it to finish to avoid zombies.
+		if reaped != nil {
+			<-reaped
+		}
 		return nil
 	}
 
@@ -183,7 +180,7 @@ func (p *CLIProcess) Stop() error {
 	p.running = false
 	stdin := p.stdin
 	cmd := p.cmd
-	waited := p.waited
+	reaped := p.reaped
 	p.mu.Unlock()
 
 	// Close stdin to signal EOF to the process
@@ -194,14 +191,21 @@ func (p *CLIProcess) Stop() error {
 	if cmd != nil && cmd.Process != nil {
 		// Send interrupt signal
 		_ = cmd.Process.Signal(os.Interrupt)
+	}
 
-		// Reap the process if the reaper goroutine hasn't already.
-		// This prevents zombie processes.
-		if !waited {
-			_ = cmd.Wait()
-			p.mu.Lock()
-			p.waited = true
-			p.mu.Unlock()
+	// Wait for the reaper goroutine to finish cmd.Wait().
+	// This is the ONLY synchronization point — we never call cmd.Wait() here.
+	if reaped != nil {
+		select {
+		case <-reaped:
+			// Process fully reaped
+		case <-time.After(10 * time.Second):
+			// Safety timeout — kill forcefully if interrupt didn't work
+			p.logger.Warn("process did not exit after SIGINT, sending SIGKILL")
+			if cmd != nil && cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+			<-reaped
 		}
 	}
 
@@ -231,16 +235,16 @@ func (p *CLIProcess) Stderr() io.Reader {
 
 // Wait implements Process.Wait.
 func (p *CLIProcess) Wait() error {
-	if p.cmd == nil {
+	p.mu.Lock()
+	reaped := p.reaped
+	p.mu.Unlock()
+	if reaped == nil {
 		return nil
 	}
-	// The reaper goroutine already calls cmd.Wait(). Calling it again
-	// is safe (returns the same result) but we track it to avoid races.
-	err := p.cmd.Wait()
+	<-reaped
 	p.mu.Lock()
-	p.waited = true
-	p.mu.Unlock()
-	return err
+	defer p.mu.Unlock()
+	return p.waitErr
 }
 
 // IsRunning implements Process.IsRunning.
