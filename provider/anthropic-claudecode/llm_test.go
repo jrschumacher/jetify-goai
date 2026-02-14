@@ -325,3 +325,403 @@ func TestLanguageModel_Stream_Error(t *testing.T) {
 	require.True(t, ok, "expected error type")
 	assert.Contains(t, errVal.Error(), "API rate limit exceeded")
 }
+
+// --- Lifecycle tests ---
+
+func TestLanguageModel_IsProcessRunning_NoProcess(t *testing.T) {
+	model := NewLanguageModel("sonnet")
+	assert.False(t, model.IsProcessRunning())
+}
+
+func TestLanguageModel_IsProcessRunning_WithProcess(t *testing.T) {
+	mockProc := process.NewMockProcess()
+	_ = mockProc.Start(context.Background())
+
+	model := NewLanguageModel("sonnet", WithProcess(mockProc))
+	assert.True(t, model.IsProcessRunning())
+}
+
+func TestLanguageModel_Close_NoProcess(t *testing.T) {
+	model := NewLanguageModel("sonnet")
+	err := model.Close()
+	assert.NoError(t, err)
+}
+
+func TestLanguageModel_Close_StopsProcess(t *testing.T) {
+	mockProc := process.NewMockProcess()
+	_ = mockProc.Start(context.Background())
+
+	model := NewLanguageModel("sonnet", WithProcess(mockProc))
+	assert.True(t, model.IsProcessRunning())
+
+	err := model.Close()
+	assert.NoError(t, err)
+	assert.False(t, mockProc.IsRunning())
+}
+
+func TestLanguageModel_RestartProcess_NoProcess(t *testing.T) {
+	model := NewLanguageModel("sonnet")
+	err := model.RestartProcess(context.Background())
+	assert.NoError(t, err)
+}
+
+func TestLanguageModel_RestartProcess_SavesSessionID(t *testing.T) {
+	mockProc := process.NewMockProcess()
+	_ = mockProc.Start(context.Background())
+	mockProc.SetSessionID("sess-to-resume")
+
+	model := NewLanguageModel("sonnet", WithProcess(mockProc))
+
+	err := model.RestartProcess(context.Background())
+	require.NoError(t, err)
+
+	// Process should be stopped and nil'd
+	assert.False(t, mockProc.IsRunning())
+	assert.Nil(t, model.proc)
+
+	// resumeSessionID should be saved for next start
+	assert.Equal(t, "sess-to-resume", model.resumeSessionID)
+}
+
+func TestLanguageModel_ConfigNeedsRestart_NoProcess(t *testing.T) {
+	model := NewLanguageModel("sonnet")
+
+	temp := 0.5
+	assert.False(t, model.ConfigNeedsRestart(api.CallOptions{Temperature: &temp}))
+}
+
+func TestLanguageModel_ConfigNeedsRestart_SameConfig(t *testing.T) {
+	mockProc := process.NewMockProcess()
+	_ = mockProc.Start(context.Background())
+
+	model := NewLanguageModel("sonnet", WithProcess(mockProc))
+	// cachedKey has no temperature set (default zero, HasTemp=false)
+
+	// No temperature in call options either
+	assert.False(t, model.ConfigNeedsRestart(api.CallOptions{}))
+}
+
+func TestLanguageModel_ConfigNeedsRestart_TemperatureChanged(t *testing.T) {
+	mockProc := process.NewMockProcess()
+	_ = mockProc.Start(context.Background())
+
+	model := NewLanguageModel("sonnet", WithProcess(mockProc))
+	// cachedKey has no temperature (HasTemp=false, Temperature=0)
+
+	// Now request a temperature change
+	temp := 0.8
+	assert.True(t, model.ConfigNeedsRestart(api.CallOptions{Temperature: &temp}))
+}
+
+func TestLanguageModel_ConfigNeedsRestart_TemperatureRemoved(t *testing.T) {
+	mockProc := process.NewMockProcess()
+	_ = mockProc.Start(context.Background())
+
+	model := NewLanguageModel("sonnet", WithProcess(mockProc))
+	// Set cachedKey to have temperature
+	model.cachedKey.Temperature = 0.5
+	model.cachedKey.HasTemp = true
+
+	// Call without temperature
+	assert.True(t, model.ConfigNeedsRestart(api.CallOptions{}))
+}
+
+// --- drainStderr tests ---
+
+func TestDrainStderr_NilStderr(t *testing.T) {
+	mockProc := process.NewMockProcess()
+	// Don't write anything to stderr, but the buffer exists
+	result := drainStderr(mockProc)
+	assert.Empty(t, result)
+}
+
+func TestDrainStderr_WithContent(t *testing.T) {
+	mockProc := process.NewMockProcess()
+	mockProc.WriteStderr([]byte("  error: something failed  \n"))
+
+	result := drainStderr(mockProc)
+	assert.Equal(t, "error: something failed", result)
+}
+
+func TestDrainStderr_TruncatesLargeContent(t *testing.T) {
+	mockProc := process.NewMockProcess()
+	// Write more than 4096 bytes
+	large := make([]byte, 8192)
+	for i := range large {
+		large[i] = 'x'
+	}
+	mockProc.WriteStderr(large)
+
+	result := drainStderr(mockProc)
+	assert.Len(t, result, 4096)
+}
+
+// --- Generate edge cases ---
+
+func TestLanguageModel_Generate_NoResultEvent(t *testing.T) {
+	// Clean EOF without result event
+	mockProc := process.NewMockProcess()
+	mockProc.WriteStdout([]byte(`{"type":"system","subtype":"init","session_id":"abc-123"}` + "\n"))
+	// No result event - stdout ends here
+
+	model := NewLanguageModel("sonnet", WithProcess(mockProc))
+
+	prompt := []api.Message{
+		&api.UserMessage{Content: []api.ContentBlock{&api.TextBlock{Text: "Hello"}}},
+	}
+
+	_, err := model.Generate(context.Background(), prompt, api.CallOptions{})
+	require.Error(t, err)
+	// Error gets classified by WrapError - the raw message contains "cli" which
+	// triggers base classifier's process failure category
+	assert.Contains(t, err.Error(), "CLI")
+}
+
+func TestLanguageModel_Generate_NoResultEvent_WithStderr(t *testing.T) {
+	// Clean EOF without result, but with stderr content
+	mockProc := process.NewMockProcess()
+	mockProc.WriteStdout([]byte(`{"type":"system","subtype":"init","session_id":"abc-123"}` + "\n"))
+	mockProc.WriteStderr([]byte("process crashed unexpectedly"))
+
+	model := NewLanguageModel("sonnet", WithProcess(mockProc))
+
+	prompt := []api.Message{
+		&api.UserMessage{Content: []api.ContentBlock{&api.TextBlock{Text: "Hello"}}},
+	}
+
+	_, err := model.Generate(context.Background(), prompt, api.CallOptions{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "process crashed unexpectedly")
+}
+
+func TestLanguageModel_Generate_InvalidJSON(t *testing.T) {
+	mockProc := process.NewMockProcess()
+	mockProc.WriteStdout([]byte(`{"type":"system","subtype":"init","session_id":"abc-123"}` + "\n"))
+	mockProc.WriteStdout([]byte(`not valid json` + "\n"))
+
+	model := NewLanguageModel("sonnet", WithProcess(mockProc))
+
+	prompt := []api.Message{
+		&api.UserMessage{Content: []api.ContentBlock{&api.TextBlock{Text: "Hello"}}},
+	}
+
+	_, err := model.Generate(context.Background(), prompt, api.CallOptions{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to parse event")
+}
+
+func TestLanguageModel_Generate_SkipsUnknownEvents(t *testing.T) {
+	mockProc := process.NewMockProcess()
+	mockProc.WriteStdout([]byte(`{"type":"system","subtype":"init","session_id":"abc-123"}` + "\n"))
+	// Unknown event types should be skipped
+	mockProc.WriteStdout([]byte(`{"type":"assistant","content":[{"type":"text","text":"partial"}]}` + "\n"))
+	mockProc.WriteStdout([]byte(`{"type":"result","subtype":"success","session_id":"abc-123","message":{"content":[{"type":"text","text":"final"}],"stop_reason":"end_turn"}}` + "\n"))
+
+	model := NewLanguageModel("sonnet", WithProcess(mockProc))
+
+	prompt := []api.Message{
+		&api.UserMessage{Content: []api.ContentBlock{&api.TextBlock{Text: "Hi"}}},
+	}
+
+	resp, err := model.Generate(context.Background(), prompt, api.CallOptions{})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+
+	textBlock, ok := resp.Content[0].(*api.TextBlock)
+	require.True(t, ok)
+	assert.Equal(t, "final", textBlock.Text)
+}
+
+func TestLanguageModel_Generate_EmptyLines(t *testing.T) {
+	mockProc := process.NewMockProcess()
+	mockProc.WriteStdout([]byte(`{"type":"system","subtype":"init","session_id":"abc-123"}` + "\n"))
+	mockProc.WriteStdout([]byte("\n"))
+	mockProc.WriteStdout([]byte("\n"))
+	mockProc.WriteStdout([]byte(`{"type":"result","subtype":"success","session_id":"abc-123","message":{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}}` + "\n"))
+
+	model := NewLanguageModel("sonnet", WithProcess(mockProc))
+
+	prompt := []api.Message{
+		&api.UserMessage{Content: []api.ContentBlock{&api.TextBlock{Text: "Hi"}}},
+	}
+
+	resp, err := model.Generate(context.Background(), prompt, api.CallOptions{})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+}
+
+// --- Stream edge cases ---
+
+func TestLanguageModel_Stream_CleanEOFWithoutResult(t *testing.T) {
+	// Stream ends without a result event - should yield an error event
+	mockProc := process.NewMockProcess()
+	mockProc.WriteStdout([]byte(`{"type":"system","subtype":"init","session_id":"abc-123"}` + "\n"))
+	mockProc.WriteStdout([]byte(`{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_123","role":"assistant"}}}` + "\n"))
+	// EOF - no result event
+
+	model := NewLanguageModel("sonnet", WithProcess(mockProc))
+
+	prompt := []api.Message{
+		&api.UserMessage{Content: []api.ContentBlock{&api.TextBlock{Text: "Hello"}}},
+	}
+
+	streamResp, err := model.Stream(context.Background(), prompt, api.CallOptions{})
+	require.NoError(t, err)
+
+	var events []api.StreamEvent
+	for event := range streamResp.Stream {
+		events = append(events, event)
+	}
+
+	// Should have metadata event from message_start, but no finish event
+	// The stream silently terminates on clean EOF (finding #4)
+	hasFinish := false
+	for _, e := range events {
+		if _, ok := e.(*api.FinishEvent); ok {
+			hasFinish = true
+		}
+	}
+	// This documents the current behavior: clean EOF without result does NOT emit FinishEvent
+	assert.False(t, hasFinish, "clean EOF without result should not emit FinishEvent (known issue)")
+}
+
+func TestLanguageModel_Stream_InvalidJSON(t *testing.T) {
+	mockProc := process.NewMockProcess()
+	mockProc.WriteStdout([]byte(`{"type":"system","subtype":"init","session_id":"abc-123"}` + "\n"))
+	mockProc.WriteStdout([]byte(`not json at all` + "\n"))
+	mockProc.WriteStdout([]byte(`{"type":"result","subtype":"success","session_id":"abc-123","usage":{"input_tokens":1,"output_tokens":1}}` + "\n"))
+
+	model := NewLanguageModel("sonnet", WithProcess(mockProc))
+
+	prompt := []api.Message{
+		&api.UserMessage{Content: []api.ContentBlock{&api.TextBlock{Text: "Hello"}}},
+	}
+
+	streamResp, err := model.Stream(context.Background(), prompt, api.CallOptions{})
+	require.NoError(t, err)
+
+	var events []api.StreamEvent
+	for event := range streamResp.Stream {
+		events = append(events, event)
+	}
+
+	// Should have an error event for the bad JSON followed by the finish event
+	hasError := false
+	hasFinish := false
+	for _, e := range events {
+		if _, ok := e.(*api.ErrorEvent); ok {
+			hasError = true
+		}
+		if _, ok := e.(*api.FinishEvent); ok {
+			hasFinish = true
+		}
+	}
+	assert.True(t, hasError, "expected error event for invalid JSON")
+	assert.True(t, hasFinish, "expected finish event after error recovery")
+}
+
+// --- Token tracker integration ---
+
+func TestLanguageModel_TokenUsage_NoTracker(t *testing.T) {
+	model := NewLanguageModel("sonnet")
+
+	u := model.TokenUsage()
+	assert.Equal(t, 0, u.InputTokens)
+	assert.Equal(t, 0, u.OutputTokens)
+	assert.Equal(t, 0, u.TotalTokens)
+}
+
+func TestLanguageModel_ResetTokenUsage_NoTracker(t *testing.T) {
+	model := NewLanguageModel("sonnet")
+	// Should not panic
+	model.ResetTokenUsage()
+}
+
+// --- Warnings tests ---
+
+func TestCallOptionWarnings(t *testing.T) {
+	opts := api.CallOptions{
+		MaxOutputTokens: 100,
+		TopP:            0.9,
+		TopK:            50,
+		Seed:            42,
+	}
+
+	warnings := callOptionWarnings(opts)
+	assert.Len(t, warnings, 4)
+
+	var settings []string
+	for _, w := range warnings {
+		settings = append(settings, w.Setting)
+		assert.Equal(t, "unsupported-setting", w.Type)
+	}
+	assert.Contains(t, settings, "max_output_tokens")
+	assert.Contains(t, settings, "top_p")
+	assert.Contains(t, settings, "top_k")
+	assert.Contains(t, settings, "seed")
+}
+
+func TestCallOptionWarnings_NoWarnings(t *testing.T) {
+	opts := api.CallOptions{}
+	warnings := callOptionWarnings(opts)
+	assert.Empty(t, warnings)
+}
+
+func TestCallOptionWarnings_TemperatureSupported(t *testing.T) {
+	temp := 0.5
+	opts := api.CallOptions{Temperature: &temp}
+	warnings := callOptionWarnings(opts)
+	assert.Empty(t, warnings, "temperature should be supported, no warning")
+}
+
+// --- ensureProcess tests ---
+
+func TestLanguageModel_EnsureProcess_ReusesExisting(t *testing.T) {
+	mockProc := process.NewMockProcess()
+	_ = mockProc.Start(context.Background())
+
+	model := NewLanguageModel("sonnet", WithProcess(mockProc))
+	// Set cachedKey to match what buildConfig would produce
+	cfg := model.buildConfig("", api.CallOptions{})
+	model.cachedKey = cfg.ConfigKey()
+
+	// ensureProcess should reuse the existing process
+	err := model.ensureProcess(context.Background(), cfg)
+	require.NoError(t, err)
+	assert.True(t, mockProc.IsRunning())
+}
+
+func TestLanguageModel_WithWorkDir(t *testing.T) {
+	model := NewLanguageModel("sonnet", WithWorkDir("/tmp/sandbox"))
+	assert.Equal(t, "/tmp/sandbox", model.workDir)
+}
+
+func TestLanguageModel_WithAllowedTools(t *testing.T) {
+	model := NewLanguageModel("sonnet", WithAllowedTools([]string{"Read", "Bash"}))
+	assert.Equal(t, []string{"Read", "Bash"}, model.allowedTools)
+}
+
+func TestLanguageModel_BuildConfig_WithWorkDir(t *testing.T) {
+	model := NewLanguageModel("sonnet", WithWorkDir("/tmp/test"))
+	cfg := model.buildConfig("system", api.CallOptions{})
+	assert.Equal(t, "/tmp/test", cfg.WorkDir)
+}
+
+func TestLanguageModel_BuildConfig_WithAllowedTools(t *testing.T) {
+	tools := []string{"Read", "Bash"}
+	model := NewLanguageModel("sonnet", WithAllowedTools(tools))
+	cfg := model.buildConfig("system", api.CallOptions{})
+	assert.Equal(t, tools, cfg.AllowedTools)
+}
+
+func TestLanguageModel_BuildConfig_NoWorkDir(t *testing.T) {
+	model := NewLanguageModel("sonnet")
+	cfg := model.buildConfig("system", api.CallOptions{})
+	assert.Empty(t, cfg.WorkDir)
+}
+
+func TestLanguageModel_BuildConfig_NoAllowedTools(t *testing.T) {
+	model := NewLanguageModel("sonnet")
+	cfg := model.buildConfig("system", api.CallOptions{})
+	assert.Nil(t, cfg.AllowedTools)
+}

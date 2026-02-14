@@ -5,6 +5,8 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"sort"
+	"strings"
 
 	"go.jetify.com/ai/provider/internal/cli"
 )
@@ -71,6 +73,11 @@ type Config struct {
 	// MaxTurns limits the number of conversation turns.
 	MaxTurns int
 
+	// AllowedTools is the list of CLI built-in tools to enable.
+	// If nil, all built-in tools are disabled (default).
+	// If non-nil, only the listed tools are enabled (e.g., []string{"Read", "Bash"}).
+	AllowedTools []string
+
 	// Logger is the structured logger for process lifecycle events.
 	// If nil, a discard logger is used.
 	Logger *slog.Logger
@@ -135,6 +142,14 @@ func WithMaxTurns(turns int) Option {
 	}
 }
 
+// WithAllowedTools sets the list of CLI built-in tools to enable.
+// If not called, all built-in tools are disabled.
+func WithAllowedTools(tools []string) Option {
+	return func(c *Config) {
+		c.AllowedTools = tools
+	}
+}
+
 // WithLogger sets the structured logger for process lifecycle events.
 func WithLogger(logger *slog.Logger) Option {
 	return func(c *Config) {
@@ -170,6 +185,12 @@ func (c *Config) ConfigKey() cli.ConfigKey {
 	}
 	if c.ResumeSessionID != "" {
 		extra["resume"] = c.ResumeSessionID
+	}
+	if len(c.AllowedTools) > 0 {
+		sorted := make([]string, len(c.AllowedTools))
+		copy(sorted, c.AllowedTools)
+		sort.Strings(sorted)
+		extra["tools"] = strings.Join(sorted, ",")
 	}
 
 	return cli.ConfigKey{

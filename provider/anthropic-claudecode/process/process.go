@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 )
@@ -121,7 +122,7 @@ func (p *CLIProcess) buildArgs() []string {
 		"-p", // Print mode
 		"--input-format", "stream-json",
 		"--output-format", "stream-json",
-		"--tools", "", // Disable built-in tools
+		"--tools", p.toolsArg(), // Control built-in tool access
 	}
 
 	if p.config.Model != "" {
@@ -160,6 +161,16 @@ func (p *CLIProcess) buildArgs() []string {
 	args = append(args, "--include-partial-messages")
 
 	return args
+}
+
+// toolsArg returns the value for the --tools flag.
+// If AllowedTools is set, returns a comma-separated list.
+// Otherwise returns empty string to disable all built-in tools.
+func (p *CLIProcess) toolsArg() string {
+	if len(p.config.AllowedTools) > 0 {
+		return strings.Join(p.config.AllowedTools, ",")
+	}
+	return ""
 }
 
 // Stop implements Process.Stop.

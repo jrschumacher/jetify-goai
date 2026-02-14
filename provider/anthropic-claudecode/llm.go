@@ -47,6 +47,22 @@ func WithLogger(logger *slog.Logger) ModelOption {
 	}
 }
 
+// WithWorkDir sets the working directory for the CLI process.
+// The CLI will be sandboxed to this directory.
+func WithWorkDir(dir string) ModelOption {
+	return func(m *LanguageModel) {
+		m.workDir = dir
+	}
+}
+
+// WithAllowedTools sets the list of CLI built-in tools to enable.
+// If not called, all built-in tools are disabled (default).
+func WithAllowedTools(tools []string) ModelOption {
+	return func(m *LanguageModel) {
+		m.allowedTools = tools
+	}
+}
+
 // LanguageModel represents a Claude Code language model.
 // It maintains a persistent process for efficient streaming and multi-turn conversations.
 type LanguageModel struct {
@@ -63,6 +79,12 @@ type LanguageModel struct {
 	// resumeSessionID is set by RestartProcess to continue a conversation
 	// using the CLI's --resume flag on the next process start.
 	resumeSessionID string
+
+	// workDir is the working directory for sandboxing the CLI process.
+	workDir string
+
+	// allowedTools is the list of CLI built-in tools to enable.
+	allowedTools []string
 
 	// retryPolicy defines how operations should be retried on failure.
 	retryPolicy *RetryPolicy
@@ -122,6 +144,12 @@ func (m *LanguageModel) buildConfig(systemPrompt string, opts api.CallOptions) *
 	if opts.Temperature != nil {
 		cfg.Temperature = opts.Temperature
 	}
+	if m.workDir != "" {
+		cfg.WorkDir = m.workDir
+	}
+	if m.allowedTools != nil {
+		cfg.AllowedTools = m.allowedTools
+	}
 	return cfg
 }
 
@@ -164,6 +192,9 @@ func (m *LanguageModel) ensureProcess(ctx context.Context, cfg *process.Config) 
 		}
 		if cfg.JSONSchema != "" {
 			procOpts = append(procOpts, process.WithJSONSchema(cfg.JSONSchema))
+		}
+		if cfg.AllowedTools != nil {
+			procOpts = append(procOpts, process.WithAllowedTools(cfg.AllowedTools))
 		}
 		if m.resumeSessionID != "" {
 			m.logger.Info("resuming session", "sessionID", m.resumeSessionID)
