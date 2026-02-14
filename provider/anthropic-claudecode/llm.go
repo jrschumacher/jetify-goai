@@ -60,6 +60,10 @@ type LanguageModel struct {
 	// If options change, the process is restarted.
 	cachedKey cli.ConfigKey
 
+	// resumeSessionID is set by RestartProcess to continue a conversation
+	// using the CLI's --resume flag on the next process start.
+	resumeSessionID string
+
 	// retryPolicy defines how operations should be retried on failure.
 	retryPolicy *RetryPolicy
 
@@ -160,6 +164,11 @@ func (m *LanguageModel) ensureProcess(ctx context.Context, cfg *process.Config) 
 		}
 		if cfg.JSONSchema != "" {
 			procOpts = append(procOpts, process.WithJSONSchema(cfg.JSONSchema))
+		}
+		if m.resumeSessionID != "" {
+			m.logger.Info("resuming session", "sessionID", m.resumeSessionID)
+			procOpts = append(procOpts, process.WithResumeSession(m.resumeSessionID))
+			m.resumeSessionID = "" // Clear after use
 		}
 		m.proc = process.NewCLIProcess(procOpts...)
 	}
@@ -354,11 +363,14 @@ func (m *LanguageModel) RestartProcess(ctx context.Context) error {
 	defer m.mu.Unlock()
 
 	if m.proc != nil {
-		m.logger.Info("restarting process")
+		// Save the session ID for --resume on the next process start
+		sessionID := m.proc.SessionID()
+		m.logger.Info("restarting process", "resumeSessionID", sessionID)
 		if err := m.proc.Stop(); err != nil {
 			return err
 		}
 		m.proc = nil
+		m.resumeSessionID = sessionID
 	}
 	return nil
 }
