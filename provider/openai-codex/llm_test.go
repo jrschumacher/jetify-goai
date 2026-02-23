@@ -2,13 +2,16 @@ package codex
 
 import (
 	"context"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.jetify.com/ai/api"
 	"go.jetify.com/ai/provider/internal/cli"
 	"go.jetify.com/ai/provider/openai-codex/codec"
+	"go.jetify.com/ai/provider/openai-codex/codec/jsonrpc"
 	"go.jetify.com/ai/provider/openai-codex/process"
 )
 
@@ -773,4 +776,124 @@ func TestLanguageModel_ProcessReuse(t *testing.T) {
 
 	// Both calls should have created threads
 	assert.Equal(t, 2, callCount)
+}
+
+func TestLanguageModel_Stream_HoldsCallMu(t *testing.T) {
+	// This test verifies that concurrent Stream() calls are serialized by callMu.
+	// The second call should block until the first iterator fully completes.
+
+	// We use two separate models pointing to two separate mocks so the mocks
+	// don't share notification channels, but they share the same callMu via the
+	// single LanguageModel instance.
+
+	mockProc := process.NewMockAppServer()
+	mockProc.SetThreadID("thread-1")
+
+	// Track ordering of thread starts to prove serialization.
+	var mu sync.Mutex
+	var order []string
+
+	notifReady := make(chan struct{}) // signals when first stream is blocked
+
+	mockProc.OnStartThread = func(ctx context.Context) (string, error) {
+		return "thread-1", nil
+	}
+
+	turnCount := 0
+	mockProc.OnStartTurn = func(ctx context.Context, threadID string, input []jsonrpc.Input, policy jsonrpc.ApprovalPolicy) error {
+		mu.Lock()
+		turnCount++
+		turn := turnCount
+		mu.Unlock()
+
+		if turn == 1 {
+			// First turn: signal ready, then wait before sending notifications.
+			// This keeps callMu held while the second Stream() tries to acquire it.
+			close(notifReady)
+			// Small delay to give the second goroutine time to block on callMu
+			go func() {
+				<-time.After(50 * time.Millisecond)
+				mu.Lock()
+				order = append(order, "first-notify")
+				mu.Unlock()
+				mockProc.SendNotification(codec.NotifyItemAgentMessageDelta, codec.TextDeltaParams{
+					ItemID: "item_1",
+					Delta:  "first",
+				})
+				mockProc.SendNotification(codec.NotifyTurnCompleted, codec.TurnCompletedParams{
+					Usage: &codec.AppServerUsage{InputTokens: 1, OutputTokens: 1},
+				})
+			}()
+		} else {
+			// Second turn: notifications sent immediately
+			go func() {
+				mu.Lock()
+				order = append(order, "second-notify")
+				mu.Unlock()
+				mockProc.SendNotification(codec.NotifyItemAgentMessageDelta, codec.TextDeltaParams{
+					ItemID: "item_2",
+					Delta:  "second",
+				})
+				mockProc.SendNotification(codec.NotifyTurnCompleted, codec.TurnCompletedParams{
+					Usage: &codec.AppServerUsage{InputTokens: 2, OutputTokens: 2},
+				})
+			}()
+		}
+		return nil
+	}
+
+	model := NewLanguageModel("o3", WithAppServer(mockProc))
+	prompt := []api.Message{
+		&api.UserMessage{Content: []api.ContentBlock{&api.TextBlock{Text: "test"}}},
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// First goroutine: start streaming, hold the lock via iterator
+	go func() {
+		defer wg.Done()
+		resp, err := model.Stream(context.Background(), prompt, api.CallOptions{})
+		require.NoError(t, err)
+		for range resp.Stream {
+			// consume all events
+		}
+		mu.Lock()
+		order = append(order, "first-done")
+		mu.Unlock()
+	}()
+
+	// Second goroutine: wait until first is in-flight, then try to stream
+	go func() {
+		defer wg.Done()
+		<-notifReady // wait until first stream is set up
+		resp, err := model.Stream(context.Background(), prompt, api.CallOptions{})
+		require.NoError(t, err)
+		for range resp.Stream {
+			// consume all events
+		}
+		mu.Lock()
+		order = append(order, "second-done")
+		mu.Unlock()
+	}()
+
+	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// The first stream must complete before the second stream's notifications.
+	// Verify: "first-notify" and "first-done" both appear before "second-done".
+	firstDoneIdx := -1
+	secondDoneIdx := -1
+	for i, v := range order {
+		if v == "first-done" {
+			firstDoneIdx = i
+		}
+		if v == "second-done" {
+			secondDoneIdx = i
+		}
+	}
+	assert.Greater(t, secondDoneIdx, firstDoneIdx,
+		"second stream should complete after first; order: %v", order)
 }
