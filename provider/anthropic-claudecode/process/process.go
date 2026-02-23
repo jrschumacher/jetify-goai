@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"go.jetify.com/ai/provider/internal/cli"
 )
 
 // CLIProcess is the real implementation of Process that spawns the Claude CLI.
@@ -58,6 +60,10 @@ func (p *CLIProcess) Start(ctx context.Context) error {
 	args := p.buildArgs()
 	p.logger.Info("starting claude CLI", "args", args, "workdir", p.config.WorkDir)
 	p.cmd = exec.CommandContext(ctx, "claude", args...)
+
+	// Clean the environment so the spawned CLI doesn't detect a parent
+	// Claude Code session and refuse to start (nested session guard).
+	p.cmd.Env = cli.CleanEnv([]string{"CLAUDE_CODE_"}, []string{"CLAUDECODE"})
 
 	// Set working directory for sandboxing
 	if p.config.WorkDir != "" {
@@ -278,3 +284,4 @@ func (p *CLIProcess) SetSessionID(id string) {
 	defer p.mu.Unlock()
 	p.sessionID = id
 }
+

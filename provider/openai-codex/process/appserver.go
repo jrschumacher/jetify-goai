@@ -9,7 +9,9 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 
+	"go.jetify.com/ai/provider/internal/cli"
 	"go.jetify.com/ai/provider/openai-codex/codec/jsonrpc"
 )
 
@@ -27,6 +29,8 @@ type AppServerProcess struct {
 	client      *jsonrpc.Client
 	running     bool
 	initialized bool
+	reaped      chan struct{} // closed by the reaper goroutine after cmd.Wait() returns
+	waitErr     error        // result of cmd.Wait(), valid after reaped is closed
 	threadID    string
 }
 
@@ -50,6 +54,10 @@ func (p *AppServerProcess) Start(ctx context.Context) error {
 
 	// Build the command
 	p.cmd = exec.CommandContext(ctx, "codex", "app-server")
+
+	// Clean the environment so the spawned CLI doesn't detect a parent
+	// session and refuse to start (nested session guard).
+	p.cmd.Env = cli.CleanEnv([]string{"CODEX_"}, []string{"CODEX"})
 
 	// Set working directory if configured
 	if p.config.WorkDir != "" {
@@ -82,6 +90,21 @@ func (p *AppServerProcess) Start(ctx context.Context) error {
 	p.client = jsonrpc.NewClient(p.stdout, p.stdin)
 
 	p.running = true
+	p.reaped = make(chan struct{})
+
+	// Monitor process exit so IsRunning() reflects reality.
+	// This is the ONLY goroutine that calls cmd.Wait(). All other code
+	// that needs to wait for exit blocks on the reaped channel instead.
+	go func() {
+		waitErr := p.cmd.Wait()
+		p.mu.Lock()
+		p.running = false
+		p.waitErr = waitErr
+		p.mu.Unlock()
+		// Close the channel AFTER updating state so readers see consistent state.
+		close(p.reaped)
+	}()
+
 	return nil
 }
 
@@ -227,29 +250,55 @@ func (p *AppServerProcess) Notifications() <-chan *jsonrpc.Notification {
 // Stop gracefully terminates the process.
 func (p *AppServerProcess) Stop() error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 
 	if !p.running {
+		reaped := p.reaped
+		p.mu.Unlock()
+		// If there's a reaper channel, wait for it to finish to avoid zombies.
+		if reaped != nil {
+			<-reaped
+		}
 		return nil
-	}
-
-	// Close the JSON-RPC client
-	if p.client != nil {
-		p.client.Close()
-	}
-
-	// Close stdin to signal EOF
-	if p.stdin != nil {
-		p.stdin.Close()
-	}
-
-	// Send interrupt signal
-	if p.cmd != nil && p.cmd.Process != nil {
-		p.cmd.Process.Signal(os.Interrupt)
 	}
 
 	p.running = false
 	p.initialized = false
+	stdin := p.stdin
+	cmd := p.cmd
+	reaped := p.reaped
+	p.mu.Unlock()
+
+	// Close the JSON-RPC client
+	p.mu.Lock()
+	if p.client != nil {
+		p.client.Close()
+	}
+	p.mu.Unlock()
+
+	// Close stdin to signal EOF
+	if stdin != nil {
+		stdin.Close()
+	}
+
+	// Send interrupt signal
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Signal(os.Interrupt)
+	}
+
+	// Wait for the reaper goroutine to finish cmd.Wait().
+	if reaped != nil {
+		select {
+		case <-reaped:
+			// Process fully reaped
+		case <-time.After(10 * time.Second):
+			// Safety timeout — kill forcefully if interrupt didn't work
+			if cmd != nil && cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+			<-reaped
+		}
+	}
+
 	return nil
 }
 
@@ -278,10 +327,16 @@ func (p *AppServerProcess) Stderr() io.Reader {
 
 // Wait blocks until the process exits.
 func (p *AppServerProcess) Wait() error {
-	if p.cmd == nil {
+	p.mu.Lock()
+	reaped := p.reaped
+	p.mu.Unlock()
+	if reaped == nil {
 		return nil
 	}
-	return p.cmd.Wait()
+	<-reaped
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.waitErr
 }
 
 // IsRunning returns true if the process is currently running.

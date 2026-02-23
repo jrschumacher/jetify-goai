@@ -318,12 +318,18 @@ func (m *LanguageModel) Generate(
 func (m *LanguageModel) Stream(
 	ctx context.Context, prompt []api.Message, opts api.CallOptions,
 ) (*api.StreamResponse, error) {
+	// Serialize access to the notification stream. The Codex CLI protocol
+	// cannot safely demultiplex concurrent turns, so we hold the lock for
+	// the entire lifetime of the stream (released in decodeEvents).
+	m.callMu.Lock()
+
 	// Extract system prompt and build user prompt
 	systemPrompt, userPrompt := codec.BuildPromptWithSystemSeparate(prompt)
 
 	// Build config and ensure process
 	cfg := m.buildConfig(systemPrompt, opts)
 	if err := m.ensureProcess(ctx, cfg); err != nil {
+		m.callMu.Unlock()
 		return nil, err
 	}
 
@@ -334,6 +340,7 @@ func (m *LanguageModel) Stream(
 	// Start a new thread for this request
 	threadID, err := proc.StartThread(ctx)
 	if err != nil {
+		m.callMu.Unlock()
 		return nil, WrapError(fmt.Errorf("failed to start thread: %w", err))
 	}
 
@@ -344,16 +351,18 @@ func (m *LanguageModel) Stream(
 
 	// Start the turn
 	if err := proc.StartTurn(ctx, threadID, input, jsonrpc.ApprovalNever); err != nil {
+		m.callMu.Unlock()
 		return nil, WrapError(fmt.Errorf("failed to start turn: %w", err))
 	}
 
-	// Create the stream decoder
+	// Create the stream decoder — it owns the callMu unlock via decodeEvents.
 	decoder := &streamDecoder{
 		ctx:          ctx,
 		proc:         proc,
 		threadID:     threadID,
 		costMonitor:  m.costMonitor,
 		tokenTracker: m.tokenTracker,
+		callMu:       &m.callMu,
 	}
 
 	return &api.StreamResponse{
@@ -369,6 +378,7 @@ type streamDecoder struct {
 	reasoning    string
 	costMonitor  *CostMonitor
 	tokenTracker *cli.TokenTracker
+	callMu       *sync.Mutex // released when iteration completes
 
 	commandExecutions     []codec.CommandExecution
 	fileChanges           []codec.FileChange
@@ -376,8 +386,11 @@ type streamDecoder struct {
 }
 
 // decodeEvents returns an iterator that yields events from the notification stream.
+// The caller must hold callMu before calling; it is released when iteration ends.
 func (d *streamDecoder) decodeEvents() iter.Seq[api.StreamEvent] {
 	return func(yield func(api.StreamEvent) bool) {
+		defer d.callMu.Unlock()
+
 		// Emit initial metadata event
 		if !yield(&api.ResponseMetadataEvent{ID: d.threadID}) {
 			return
